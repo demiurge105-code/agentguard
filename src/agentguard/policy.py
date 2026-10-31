@@ -80,6 +80,12 @@ class Decision:
     reason_code: DecisionReason
     reason: str
 
+    def to_dict(self) -> dict:
+        return {
+            "allowed": self.allowed,
+            "reason_code": self.reason_code.value,
+            "reason": self.reason,
+        }
 
 def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
     """Evaluate a proposed transaction against a policy.
@@ -123,3 +129,5 @@ def _normalise_recipient(value: str) -> str:
     if not normalised:
         raise ValueError("recipient identifiers must not be empty.")
     return normalised
+
+

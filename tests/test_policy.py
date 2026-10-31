@@ -1,8 +1,12 @@
 from decimal import Decimal
-
 import pytest
-
-from agentguard import DecisionReason, Policy, TransactionRequest, check_transaction
+from agentguard import (
+    Decision,
+    DecisionReason,
+    Policy,
+    TransactionRequest,
+    check_transaction,
+)
 
 
 @pytest.fixture
@@ -160,3 +164,35 @@ def test_rule_order_prefers_amount_over_daily_and_recipient(policy: Policy) -> N
     )
     assert decision.allowed is False
     assert decision.reason_code is DecisionReason.RECIPIENT_NOT_ALLOWED
+
+
+def test_decision_to_dict_allowed():
+    decision = Decision(
+        allowed=True,
+        reason_code=DecisionReason.ALLOWED,
+        reason="Transaction is allowed by the policy."
+    )
+
+    result = decision.to_dict()
+
+    assert result == {
+        "allowed": True,
+        "reason_code": "allowed",
+        "reason": "Transaction is allowed by the policy."
+    }
+
+
+def test_decision_to_dict_denied():
+    decision = Decision(
+        allowed=False,
+        reason_code=DecisionReason.AMOUNT_EXCEEDS_MAXIMUM,
+        reason="Transaction exceeds the maximum transaction limit."
+    )
+
+    result = decision.to_dict()
+
+    assert result == {
+        "allowed": False,
+        "reason_code": "amount_exceeds_maximum",
+        "reason": "Transaction exceeds the maximum transaction limit."
+    }
