@@ -1,115 +1,164 @@
 # AgentGuard
 
-**An open-source permission layer for AI agents interacting with crypto wallets.**
+**An open-source policy engine for evaluating crypto transaction requests from AI agents.**
+
+AgentGuard is an early-stage project that evaluates simulated transaction requests against explicit, testable policies. It currently provides a Python policy engine and a local FastAPI interface.
+
+> **Status: experimental, simulation-only.** AgentGuard does not connect to wallets, sign transactions, submit blockchain transactions, or prevent operations that bypass its evaluation flow.
 
 ## The problem
 
-AI agents can interact with external tools, but crypto wallet operations need explicit, testable permissions.
+AI agents can interact with external tools, but transaction-related actions need clear and testable limits. Developers need a way to evaluate proposed operations against rules such as maximum transaction amounts, daily spending limits, and approved recipients.
 
-## Our approach
+## Current capabilities
 
-AgentGuard is an early-stage project exploring a policy engine that evaluates simulated transactions before execution.
+The current implementation includes:
 
-Initial policies:
-- Maximum transaction amount
-- Daily spending limit
-- Recipient address allowlist
-- ALLOW or DENY decisions with explanations
+- A deterministic policy engine.
+- A maximum transaction amount check.
+- A daily spending limit check.
+- A recipient allowlist with case-insensitive recipient comparison.
+- Structured `ALLOW` / `DENY` decisions.
+- Stable reason codes and human-readable explanations.
+- Decimal input validation, including rejection of `NaN`, `sNaN`, and positive or negative infinity.
+- A FastAPI endpoint for evaluating simulated transaction requests.
+- Automated tests and pull-request CI.
+
+The engine checks rules in this order: maximum transaction amount, daily spending limit, then recipient allowlist. The first failed rule determines the denial reason.
+
+## Requirements
+
+- Python 3.10+
+- Git
+
+The package currently declares FastAPI and Uvicorn as runtime dependencies. Pytest and HTTPX are included in the optional development dependencies.
 
 ## Quick start
 
-AgentGuard currently has no runtime dependencies. It requires Python 3.10+.
+Clone the repository and install the package with its development dependencies:
 
 ```bash
 git clone https://github.com/demiurge105-code/agentguard.git
 cd agentguard
+
 python -m venv .venv
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-# macOS / Linux:
+
+# Windows PowerShell
+.venv\\Scripts\\Activate.ps1
+
+# macOS / Linux
 # source .venv/bin/activate
+
 python -m pip install -e ".[dev]"
+```
+
+Run the test suite:
+
+```bash
 python -m pytest
+```
+
+Run the basic example:
+
+```bash
 python examples/basic_check.py
 ```
 
-Expected result: the test suite passes and the example prints an allowed
-`Decision`. If `pytest` is not found, run it as `python -m pytest` from the
-activated virtual environment.
+The example should print an allowed `Decision`.
 
-The policy engine is deliberately a simulator: it makes a decision about a
-proposed transaction but never submits a transaction or accesses a wallet.
+## Python usage
 
 ```python
 from agentguard import Policy, TransactionRequest, check_transaction
 
-policy = Policy("50", "200", ["0xABC"])
-request = TransactionRequest(amount="35", recipient="0xABC", daily_spent="100")
+policy = Policy(
+    max_transaction="50",
+    daily_limit="200",
+    allowed_recipients=["0xABC"],
+)
+
+request = TransactionRequest(
+    amount="35",
+    recipient="0xABC",
+    daily_spent="100",
+)
 
 decision = check_transaction(request, policy)
-# Decision(allowed=True, reason_code=<DecisionReason.ALLOWED: 'allowed'>, ...)
+print(decision.to_dict())
 ```
 
-See [the architecture](docs/architecture.md) for the MVP contract and rule order.
+Amounts and limits should be provided as `Decimal` values or decimal strings, not floats.
 
-## Project status and next milestones
+## Local API
 
-The simulation-only policy engine, example, tests, and pull-request CI are in
-place. The next deliberately small milestones are:
-
-1. Review and merge the current JSON-serialization contribution.
-2. Add a minimal FastAPI wrapper that delegates to the policy engine.
-3. Add a demo agent only after the API contract is stable.
-
-EVM testnet work is explicitly out of scope until the simulator and its API
-have proven reliable.
-
-## Run the local API
-
-The API is also simulation-only: it evaluates a supplied request and never
-accesses a wallet, signs, or submits a transaction.
+Start the local FastAPI application:
 
 ```bash
 uvicorn agentguard.api:app --reload
 ```
 
-Open `http://127.0.0.1:8000/docs` to try the generated local API documentation.
-The endpoint accepts `POST /check-transaction` with the policy and request
-fields shown in [the architecture](docs/architecture.md), then returns
-`allowed`, `reason_code`, and `reason`.
+Open the interactive API documentation at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
-## Tech stack
+The `POST /check-transaction` endpoint accepts:
 
-- Python
-- FastAPI
-- pytest
-- SQLite (planned)
-- TypeScript / React (planned)
+- `amount`
+- `recipient`
+- `daily_spent`
+- `max_transaction`
+- `daily_limit`
+- `allowed_recipients`
 
-## Current status
+A successful evaluation returns `allowed`, `reason_code`, and `reason`. See [docs/architecture.md](docs/architecture.md) for the current contract and evaluation rules.
 
-🚧 Early development. Simulation only. AgentGuard does not currently secure real wallets or prevent transactions submitted outside its policy engine.
+### Important API limitation
+
+The current API is a simulation interface, not an enforcement boundary. The caller supplies the policy values and `daily_spent` with each request. AgentGuard does not yet store owner-controlled policies or independently track cumulative spending. A caller could therefore supply different policy values or an inaccurate spending total.
+
+Do not use this API as the sole control protecting real funds.
+
+## Architecture
+
+The current implementation consists of:
+
+- **Policy and request models** — validate policy limits, transaction amounts, and recipient identifiers.
+- **Policy engine** — evaluates a request and returns a deterministic decision.
+- **FastAPI interface** — exposes the evaluation flow over HTTP.
+- **Tests and examples** — demonstrate and verify the simulation behaviour.
+
+See [docs/architecture.md](docs/architecture.md) for more detail.
+
+## Roadmap
+
+Planned areas of work include:
+
+1. Owner-controlled policy storage, rather than accepting policy values from every caller.
+2. Reliable daily-spending accounting maintained by AgentGuard.
+3. A decision log for recording evaluation outcomes.
+4. A demo integration with an AI agent.
+5. Further security design and isolated wallet or testnet integration research.
+
+The roadmap may change as the project is tested with developers and potential users.
 
 ## Contributing
 
-We welcome beginner and early-career developers interested in Python, backend development, AI agents, Web3, testing, and security. Start with an issue labelled [`good first issue`](https://github.com/demiurge105-code/agentguard/labels/good%20first%20issue).
+Contributions are welcome from developers interested in Python, backend development, AI agents, Web3, testing, and security.
 
-Before choosing work, check whether an issue already has an active pull
-request or a contributor who has claimed it. For the next small starter task,
-see the maintainer-ready [issue draft](docs/starter-task-non-finite-decimals.md).
-It is intentionally scoped to one focused pull request and includes its
-acceptance criteria and tests.
+- Browse [good first issues](https://github.com/demiurge105-code/agentguard/labels/good%20first%20issue).
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before starting.
+- Check whether an issue already has an active pull request or a contributor working on it.
+- Run `python -m pytest` before submitting a change.
 
-New here? Read [CONTRIBUTING.md](CONTRIBUTING.md), complete the Quick start
-above, then run `python -m pytest` before changing anything.
-
-Every pull request automatically runs the test suite on supported Python versions.
+Pull requests automatically run the test suite on the Python versions configured in CI.
 
 This is an unfunded collaborative project. Participation is voluntary; there is no salary or guaranteed future compensation.
 
 ## Security
 
-Do not use this experimental project to control real funds. Never commit private keys, seed phrases, or API secrets.
+AgentGuard is experimental software and is not currently a wallet security system.
+
+It does not hold keys, sign transactions, submit transactions, or stop an agent from bypassing the API. Do not use it to control real funds or treat an `ALLOW` decision as proof that a transaction is safe.
+
+Never commit private keys, seed phrases, API keys, or other secrets.
 
 ## License
 
