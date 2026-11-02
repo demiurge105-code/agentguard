@@ -196,3 +196,33 @@ def test_decision_to_dict_denied():
         "reason_code": "amount_exceeds_maximum",
         "reason": "Transaction exceeds the maximum transaction limit."
     }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "NaN",
+        "sNaN",
+        "Infinity",
+        "-Infinity",
+        Decimal("NaN"),
+        Decimal("sNaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+@pytest.mark.parametrize("field", ["max_transaction", "daily_limit", "amount", "daily_spent"])
+def test_rejects_nonfinite_decimal_values(value: Decimal | str, field: str) -> None:
+    if field in ("max_transaction", "daily_limit"):
+        kwargs = {
+            "max_transaction": value if field == "max_transaction" else "50",
+            "daily_limit": value if field == "daily_limit" else "200",
+            "allowed_recipients": ["0xABC"],
+        }
+        with pytest.raises(ValueError, match=f"{field} must be a finite decimal value"):
+            Policy(**kwargs)
+    else:
+        amount = value if field == "amount" else "10"
+        daily_spent = value if field == "daily_spent" else "0"
+        with pytest.raises(ValueError, match=f"{field} must be a finite decimal value"):
+            TransactionRequest(amount, "0xABC", daily_spent)

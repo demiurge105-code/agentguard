@@ -119,9 +119,13 @@ def _deny(reason_code: DecisionReason, reason: str) -> Decision:
 
 def _as_decimal(value: Decimal | str, field_name: str) -> Decimal:
     try:
-        return Decimal(value)
+        amount = Decimal(value)
     except Exception as error:
         raise ValueError(f"{field_name} must be a valid decimal value.") from error
+    # Reject NaN / ±Infinity / sNaN so policy math stays total and comparable (#9).
+    if not amount.is_finite():
+        raise ValueError(f"{field_name} must be a finite decimal value.")
+    return amount
 
 
 def _normalise_recipient(value: str) -> str:
