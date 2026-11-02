@@ -2,13 +2,17 @@ from decimal import Decimal
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator
+
 from agentguard.policy import Policy, TransactionRequest, check_transaction
 
+
+# This app evaluates simulated requests only. It never signs or submits a
+# transaction, and it does not access wallets or private keys.
 app = FastAPI(title="AgentGuard API")
 
 
 @app.get("/")
-def home():
+def home() -> dict[str, str]:
     return {"message": "AgentGuard API is running"}
 
 
@@ -38,21 +42,19 @@ class TransactionInput(BaseModel):
                 )
         return values
 
-
-
 @app.post("/check-transaction")
-def check_transaction_api(data: TransactionInput):
-
+def check_transaction_api(data: TransactionInput) -> dict[str, object]:
+    """Evaluate a simulated request through the existing policy engine."""
     policy = Policy(
         max_transaction=data.max_transaction,
         daily_limit=data.daily_limit,
-        allowed_recipients=data.allowed_recipients
+        allowed_recipients=data.allowed_recipients,
     )
 
     request = TransactionRequest(
         amount=data.amount,
         recipient=data.recipient,
-        daily_spent=data.daily_spent
+        daily_spent=data.daily_spent,
     )
 
     decision = check_transaction(request, policy)

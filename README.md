@@ -64,6 +64,20 @@ place. The next deliberately small milestones are:
 EVM testnet work is explicitly out of scope until the simulator and its API
 have proven reliable.
 
+## Run the local API
+
+The API is also simulation-only: it evaluates a supplied request and never
+accesses a wallet, signs, or submits a transaction.
+
+```bash
+uvicorn agentguard.api:app --reload
+```
+
+Open `http://127.0.0.1:8000/docs` to try the generated local API documentation.
+The endpoint accepts `POST /check-transaction` with the policy and request
+fields shown in [the architecture](docs/architecture.md), then returns
+`allowed`, `reason_code`, and `reason`.
+
 ## Tech stack
 
 - Python

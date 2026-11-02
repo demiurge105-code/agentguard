@@ -1,87 +1,120 @@
-from fastapi.testclient import TestClient
+import pytest
+from httpx import ASGITransport, AsyncClient
+
 from agentguard.api import app
 
-client = TestClient(app)
+
+@pytest.fixture
+def anyio_backend() -> str:
+    """Run API tests with asyncio only; Trio is not a project dependency."""
+    return "asyncio"
 
 
-def test_check_transaction_allowed():
-    payload = {
-        "amount": "80",
-        "recipient": "Alice",
-        "daily_spent": "200",
-        "max_transaction": "100",
-        "daily_limit": "500",
-        "allowed_recipients": ["Alice", "Bob"]
-    }
+async def post_transaction(payload: dict[str, object]):
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        return await client.post("/check-transaction", json=payload)
 
-    response = client.post("/check-transaction", json=payload)
 
-    assert response.status_code == 200
-
-    data = response.json()
-
-    assert data["allowed"] is True
-    assert data["reason_code"] == "allowed"
-    assert data["reason"] == "Transaction is allowed by the policy."
-
-def test_check_transaction_denied():
-    payload = {
-        "amount": "150",
-        "recipient": "Alice",
-        "daily_spent": "200",
-        "max_transaction": "100",
-        "daily_limit": "500",
-        "allowed_recipients": ["Alice", "Bob"]
-    }
-
-    response = client.post("/check-transaction", json=payload)
+@pytest.mark.anyio
+async def test_check_transaction_allowed() -> None:
+    response = await post_transaction(
+        {
+            "amount": "80",
+            "recipient": "Alice",
+            "daily_spent": "200",
+            "max_transaction": "100",
+            "daily_limit": "500",
+            "allowed_recipients": ["Alice", "Bob"],
+        }
+    )
 
     assert response.status_code == 200
-
-    data = response.json()
-
-    assert data["allowed"] is False
-    assert data["reason_code"] == "amount_exceeds_maximum"
-    assert data["reason"] == "Transaction exceeds the maximum transaction limit."
-
-def test_check_transaction_negative_amount():
-    payload = {
-        "amount": "-50",
-        "recipient": "Alice",
-        "daily_spent": "200",
-        "max_transaction": "100",
-        "daily_limit": "500",
-        "allowed_recipients": ["Alice", "Bob"]
+    assert response.json() == {
+        "allowed": True,
+        "reason_code": "allowed",
+        "reason": "Transaction is allowed by the policy.",
     }
 
-    response = client.post("/check-transaction", json=payload)
+
+@pytest.mark.anyio
+async def test_check_transaction_denied() -> None:
+    response = await post_transaction(
+        {
+            "amount": "150",
+            "recipient": "Alice",
+            "daily_spent": "200",
+            "max_transaction": "100",
+            "daily_limit": "500",
+            "allowed_recipients": ["Alice", "Bob"],
+        }
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason_code"] == "amount_exceeds_maximum"
+
+
+@pytest.mark.anyio
+async def test_check_transaction_uses_the_existing_daily_limit_rule() -> None:
+    response = await post_transaction(
+        {
+            "amount": "80",
+            "recipient": "Alice",
+            "daily_spent": "450",
+            "max_transaction": "100",
+            "daily_limit": "500",
+            "allowed_recipients": ["Alice", "Bob"],
+        }
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason_code"] == "daily_limit_exceeded"
+
+
+@pytest.mark.anyio
+async def test_check_transaction_rejects_a_negative_amount() -> None:
+    response = await post_transaction(
+        {
+            "amount": "-50",
+            "recipient": "Alice",
+            "daily_spent": "200",
+            "max_transaction": "100",
+            "daily_limit": "500",
+            "allowed_recipients": ["Alice", "Bob"],
+        }
+    )
 
     assert response.status_code == 422
 
-def test_check_transaction_empty_recipient():
-    payload = {
-        "amount": "80",
-        "recipient": "   ",
-        "daily_spent": "200",
-        "max_transaction": "100",
-        "daily_limit": "500",
-        "allowed_recipients": ["Alice", "Bob"]
-    }
 
-    response = client.post("/check-transaction", json=payload)
+@pytest.mark.anyio
+async def test_check_transaction_rejects_an_empty_recipient() -> None:
+    response = await post_transaction(
+        {
+            "amount": "80",
+            "recipient": "   ",
+            "daily_spent": "200",
+            "max_transaction": "100",
+            "daily_limit": "500",
+            "allowed_recipients": ["Alice", "Bob"],
+        }
+    )
 
     assert response.status_code == 422
 
-def test_check_transaction_invalid_allowed_recipients():
-    payload = {
-        "amount": "80",
-        "recipient": "Alice",
-        "daily_spent": "200",
-        "max_transaction": "100",
-        "daily_limit": "500",
-        "allowed_recipients": ["Alice", "   "]
-    }
 
-    response = client.post("/check-transaction", json=payload)
+@pytest.mark.anyio
+async def test_check_transaction_rejects_invalid_allowed_recipients() -> None:
+    response = await post_transaction(
+        {
+            "amount": "80",
+            "recipient": "Alice",
+            "daily_spent": "200",
+            "max_transaction": "100",
+            "daily_limit": "500",
+            "allowed_recipients": ["Alice", "   "],
+        }
+    )
 
     assert response.status_code == 422

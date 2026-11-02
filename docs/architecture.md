@@ -97,11 +97,22 @@ check_transaction(request, policy) -> Decision
 
 ### API
 
-The API exposes the policy engine to external agents.
+The FastAPI wrapper exposes the policy engine to external agents without
+duplicating policy rules. It is a local simulation interface, not a wallet or
+transaction service.
 
-Initial endpoint:
+Endpoint:
 
 POST /check-transaction
+
+The request supplies `amount`, `recipient`, `daily_spent`, `max_transaction`,
+`daily_limit`, and `allowed_recipients`. A successful response contains
+`allowed`, `reason_code`, and `reason`. Invalid request input receives the
+framework's validation response. Run it locally with:
+
+```bash
+uvicorn agentguard.api:app --reload
+```
 
 ### Decision Log
 
