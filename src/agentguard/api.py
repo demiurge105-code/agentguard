@@ -64,9 +64,15 @@ def create_app(
     admin_token: str | None = None,
 ) -> FastAPI:
     """Create an app with injectable storage and owner token for testing."""
-    if store is None:
-        db_path = os.getenv("AGENTGUARD_DB_PATH", "agentguard.db")
-        store = SQLitePolicyStore(Path(db_path))
+    policy_store = store
+
+    def get_store() -> SQLitePolicyStore:
+        """Create the default database only when an endpoint needs storage."""
+        nonlocal policy_store
+        if policy_store is None:
+            db_path = os.getenv("AGENTGUARD_DB_PATH", "agentguard.db")
+            policy_store = SQLitePolicyStore(Path(db_path))
+        return policy_store
 
     if admin_token is None:
         admin_token = os.getenv("AGENTGUARD_ADMIN_TOKEN")
@@ -100,7 +106,7 @@ def create_app(
             daily_limit=data.daily_limit,
             allowed_recipients=data.allowed_recipients,
         )
-        policy_id = store.create_policy(policy)
+        policy_id = get_store().create_policy(policy)
 
         return {
             "policy_id": policy_id,
@@ -112,7 +118,7 @@ def create_app(
     @application.post("/check-transaction")
     def check_transaction_api(data: TransactionInput) -> dict[str, object]:
         """Evaluate a simulated request against an owner-created policy."""
-        policy = store.get_policy(data.policy_id)
+        policy = get_store().get_policy(data.policy_id)
         if policy is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

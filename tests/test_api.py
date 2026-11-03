@@ -1,6 +1,9 @@
+import importlib
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import agentguard.api as api_module
 from agentguard.api import create_app
 from agentguard.storage import SQLitePolicyStore
 
@@ -139,3 +142,37 @@ async def test_check_transaction_rejects_empty_recipient(app):
         )
 
     assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_default_database_is_created_only_when_storage_is_used(tmp_path, monkeypatch):
+    db_path = tmp_path / "configured" / "agentguard.db"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENTGUARD_DB_PATH", str(db_path))
+
+    # Reloading the module simulates importing it in a fresh process.
+    importlib.reload(api_module)
+    assert not db_path.exists()
+
+    app = api_module.create_app(admin_token="test-admin-token")
+    assert not db_path.exists()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        home = await client.get("/")
+        assert home.status_code == 200
+        assert not db_path.exists()
+
+        created = await create_policy(client, "test-admin-token")
+
+    assert created.status_code == 201
+    assert db_path.is_file()
+
+
+def test_injected_store_does_not_create_default_database(tmp_path, monkeypatch):
+    db_path = tmp_path / "default.db"
+    monkeypatch.setenv("AGENTGUARD_DB_PATH", str(db_path))
+
+    injected_store = SQLitePolicyStore(tmp_path / "injected.db")
+    create_app(store=injected_store, admin_token="test-admin-token")
+
+    assert not db_path.exists()
