@@ -37,7 +37,7 @@ async def test_unset_admin_token_fails_closed(tmp_path,monkeypatch):
 @pytest.mark.anyio
 async def test_check_uses_server_side_daily_accounting(app,admin_token):
     async with AsyncClient(transport=ASGITransport(app=app),base_url="http://test") as c:
-        pid=(await create_policy(c,admin_token)).json()["policy_id"]
+        pid=(await create_policy(c,admin_token,{"max_transaction":"1000","daily_limit":"500","allowed_recipients":["Alice","Bob"]})).json()["policy_id"]
         first=await c.post("/check-transaction",json=tx(pid,"one","300"))
         second=await c.post("/check-transaction",json=tx(pid,"two","250"))
     assert first.json()["allowed"] is True and second.json()["reason_code"]=="daily_limit_exceeded"
@@ -60,7 +60,7 @@ async def test_unknown_policy_returns_404(app):
 @pytest.mark.anyio
 async def test_api_retry_is_idempotent(app,admin_token):
     async with AsyncClient(transport=ASGITransport(app=app),base_url="http://test") as c:
-        pid=(await create_policy(c,admin_token)).json()["policy_id"]; payload=tx(pid,"retry","300")
+        pid=(await create_policy(c,admin_token,{"max_transaction":"1000","daily_limit":"500","allowed_recipients":["Alice","Bob"]})).json()["policy_id"]; payload=tx(pid,"retry","300")
         first=await c.post("/check-transaction",json=payload); retry=await c.post("/check-transaction",json=payload)
         next_req=await c.post("/check-transaction",json=tx(pid,"next","250"))
     assert first.json()==retry.json() and next_req.json()["reason_code"]=="daily_limit_exceeded"
