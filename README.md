@@ -144,7 +144,7 @@ The server generates and returns a `policy_id`. Policy values are stored in SQLi
   "policy_id": "<policy-id-returned-when-created>",
   "amount": "35",
   "recipient": "0xABC",
-  "daily_spent": "100"
+  "request_id": "agent-run-0001"
 }
 ```
 
@@ -154,7 +154,7 @@ The response contains `allowed`, `reason_code`, and `reason`. The endpoint loads
 
 This is still a simulation interface, not a secure transaction-enforcement boundary.
 
-**The caller still supplies `daily_spent` on each request.** A malicious caller can lie about the amount already spent and bypass the intended daily limit. Persistent, trusted daily-spending accounting with concurrency protection is a separate future task and is not implemented here.
+Daily usage is derived from SQLite reservations. Evaluation and reservation run in one serialized write transaction, so concurrent requests cannot collectively reserve more than the daily limit. Only allowed requests reserve budget; denied requests do not. Usage resets at 00:00 UTC. A reservation is budget allocated to an allowed simulated request, not proof that funds were spent or a transaction was broadcast; settlement and release are not implemented.
 
 The owner token protects policy creation; it does not authenticate callers of `/check-transaction` or bind a policy to a particular agent. Do not use this API as the sole control protecting real funds.
 
@@ -174,8 +174,8 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 
 Planned areas of work include:
 
-1. Trusted daily-spending accounting maintained by AgentGuard, including safe concurrency.
-2. A decision log for recording evaluation outcomes.
+1. Reservation settlement/release and authenticated agent identities.
+2. A decision log and operational observability.
 3. A demo integration with an AI agent.
 4. Further security design and isolated wallet or testnet integration research.
 
