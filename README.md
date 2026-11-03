@@ -2,7 +2,7 @@
 
 **An open-source policy engine for evaluating crypto transaction requests from AI agents.**
 
-AgentGuard is an early-stage project that evaluates simulated transaction requests against explicit, testable policies. It currently provides a Python policy engine and a local FastAPI interface.
+AgentGuard is an early-stage project that evaluates simulated transaction requests against explicit, testable policies. It provides a Python policy engine, SQLite-backed owner-controlled policy storage, and a local FastAPI interface.
 
 > **Status: experimental, simulation-only.** AgentGuard does not connect to wallets, sign transactions, submit blockchain transactions, or prevent operations that bypass its evaluation flow.
 
@@ -21,7 +21,9 @@ The current implementation includes:
 - Structured `ALLOW` / `DENY` decisions.
 - Stable reason codes and human-readable explanations.
 - Decimal input validation, including rejection of `NaN`, `sNaN`, and positive or negative infinity.
-- A FastAPI endpoint for evaluating simulated transaction requests.
+- SQLite storage for owner-created policies; monetary values are stored as decimal strings.
+- Owner-token-protected policy creation.
+- A FastAPI endpoint that evaluates requests against a stored policy.
 - Automated tests and pull-request CI.
 
 The engine checks rules in this order: maximum transaction amount, daily spending limit, then recipient allowlist. The first failed rule determines the denial reason.
@@ -99,22 +101,62 @@ uvicorn agentguard.api:app --reload
 
 Open the interactive API documentation at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
-The `POST /check-transaction` endpoint accepts:
+### Configuration
 
-- `amount`
-- `recipient`
-- `daily_spent`
-- `max_transaction`
-- `daily_limit`
-- `allowed_recipients`
+Set an owner token before creating policies. Keep it secret and do not commit it:
 
-A successful evaluation returns `allowed`, `reason_code`, and `reason`. See [docs/architecture.md](docs/architecture.md) for the current contract and evaluation rules.
+```bash
+# macOS / Linux
+export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
 
-### Important API limitation
+# Windows PowerShell
+$env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
+```
 
-The current API is a simulation interface, not an enforcement boundary. The caller supplies the policy values and `daily_spent` with each request. AgentGuard does not yet store owner-controlled policies or independently track cumulative spending. A caller could therefore supply different policy values or an inaccurate spending total.
+The SQLite database path can be changed with `AGENTGUARD_DB_PATH`. If unset, the application uses `agentguard.db` in the current working directory.
 
-Do not use this API as the sole control protecting real funds.
+If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation is disabled (fail closed).
+
+### Create a policy
+
+`POST /policies` requires the owner token in the Authorization header:
+
+```http
+POST /policies
+Authorization: Bearer <your-admin-token>
+Content-Type: application/json
+
+{
+  "max_transaction": "50",
+  "daily_limit": "200",
+  "allowed_recipients": ["0xABC", "0xDEF"]
+}
+```
+
+The server generates and returns a `policy_id`. Policy values are stored in SQLite; monetary values are stored as decimal strings.
+
+### Check a transaction
+
+`POST /check-transaction` accepts only the policy ID and proposed transaction data:
+
+```json
+{
+  "policy_id": "<policy-id-returned-when-created>",
+  "amount": "35",
+  "recipient": "0xABC",
+  "daily_spent": "100"
+}
+```
+
+The response contains `allowed`, `reason_code`, and `reason`. The endpoint loads policy limits and recipients from SQLite; callers cannot override them in the request. Unknown policy IDs return HTTP 404.
+
+### Important security limitation
+
+This is still a simulation interface, not a secure transaction-enforcement boundary.
+
+**The caller still supplies `daily_spent` on each request.** A malicious caller can lie about the amount already spent and bypass the intended daily limit. Persistent, trusted daily-spending accounting with concurrency protection is a separate future task and is not implemented here.
+
+The owner token protects policy creation; it does not authenticate callers of `/check-transaction` or bind a policy to a particular agent. Do not use this API as the sole control protecting real funds.
 
 ## Architecture
 
@@ -122,7 +164,8 @@ The current implementation consists of:
 
 - **Policy and request models** — validate policy limits, transaction amounts, and recipient identifiers.
 - **Policy engine** — evaluates a request and returns a deterministic decision.
-- **FastAPI interface** — exposes the evaluation flow over HTTP.
+- **SQLite policy store** — persists owner-created policies separately from the policy engine.
+- **FastAPI interface** — exposes owner-authenticated policy creation and transaction evaluation.
 - **Tests and examples** — demonstrate and verify the simulation behaviour.
 
 See [docs/architecture.md](docs/architecture.md) for more detail.
@@ -131,11 +174,10 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 
 Planned areas of work include:
 
-1. Owner-controlled policy storage, rather than accepting policy values from every caller.
-2. Reliable daily-spending accounting maintained by AgentGuard.
-3. A decision log for recording evaluation outcomes.
-4. A demo integration with an AI agent.
-5. Further security design and isolated wallet or testnet integration research.
+1. Trusted daily-spending accounting maintained by AgentGuard, including safe concurrency.
+2. A decision log for recording evaluation outcomes.
+3. A demo integration with an AI agent.
+4. Further security design and isolated wallet or testnet integration research.
 
 The roadmap may change as the project is tested with developers and potential users.
 
@@ -156,7 +198,7 @@ This is an unfunded collaborative project. Participation is voluntary; there is 
 
 AgentGuard is experimental software and is not currently a wallet security system.
 
-It does not hold keys, sign transactions, submit transactions, or stop an agent from bypassing the API. Do not use it to control real funds or treat an `ALLOW` decision as proof that a transaction is safe.
+It does not hold keys, sign transactions, submit transactions, or stop an agent from bypassing the API. The owner token is a basic shared-secret mechanism for policy creation, not a complete authentication or authorization system. Do not use an `ALLOW` decision as proof that a transaction is safe.
 
 Never commit private keys, seed phrases, API keys, or other secrets.
 
