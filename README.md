@@ -174,8 +174,8 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 
 Planned areas of work include:
 
-1. Trusted daily-spending accounting maintained by AgentGuard, including safe concurrency.
-2. A decision log for recording evaluation outcomes.
+1. Reservation settlement/release and authenticated agent identities.
+2. A decision log and operational observability.
 3. A demo integration with an AI agent.
 4. Further security design and isolated wallet or testnet integration research.
 
