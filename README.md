@@ -171,6 +171,44 @@ The response contains the new `agent_token` once. Rotation replaces the stored h
 
 On startup, AgentGuard adds the nullable `agent_token_hash` column to an older SQLite `policies` table when needed. Existing policies are preserved, but they have no agent token and therefore cannot be used through `/check-transaction` until the owner rotates a token for each policy.
 
+### Run the demo agent
+
+The demo agent is a deterministic Python script, not an LLM. It creates a temporary-use policy through the local API, receives a per-policy agent token, and proposes two hypothetical transactions: one within the policy and one above the per-transaction limit.
+
+Start the API in one terminal (set the same owner token in the terminal where the API runs):
+
+```bash
+# macOS / Linux
+export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
+uvicorn agentguard.api:app --reload
+```
+
+Windows PowerShell:
+
+```powershell
+$env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
+uvicorn agentguard.api:app --reload
+```
+
+In a second terminal, from the repository root, set the same owner token and run the demo:
+
+```bash
+# macOS / Linux
+export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
+python examples/demo_agent.py
+```
+
+Windows PowerShell:
+
+```powershell
+$env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
+python examples/demo_agent.py
+```
+
+The script prints the policy decision and reason for each proposal. It keeps the returned agent token in memory and does not print it. Each run creates a new policy in the configured SQLite database. The demo accepts only a local loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+
+This example demonstrates the API integration flow only. It does not use an LLM, connect to a wallet, sign or broadcast transactions, or enforce policy against an agent that bypasses the API.
+
 ### Important security limitation
 
 This is still a simulation interface, not a secure transaction-enforcement boundary.

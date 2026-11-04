@@ -1,0 +1,139 @@
+"""Run a deterministic, simulation-only agent against a local AgentGuard API.
+
+Start the API first, then run: python examples/demo_agent.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
+
+
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def local_api_url(value: str) -> str:
+    """Accept only a plain HTTP URL on loopback to avoid leaking the admin token."""
+    parsed = urlsplit(value.strip())
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in _ALLOWED_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "AGENTGUARD_API_URL must be a local URL such as http://127.0.0.1:8000"
+        )
+    # Accessing .port also validates malformed/out-of-range ports.
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError("AGENTGUARD_API_URL contains an invalid port.") from error
+    return value.strip().rstrip("/")
+
+
+def api_request(
+    base_url: str,
+    path: str,
+    payload: dict[str, object],
+    bearer_token: str,
+) -> dict[str, object]:
+    request = Request(
+        f"{base_url}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {bearer_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        try:
+            detail = json.loads(error.read().decode("utf-8")).get("detail", "Request failed")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            detail = "Request failed"
+        raise RuntimeError(f"AgentGuard API returned HTTP {error.code}: {detail}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("AgentGuard API returned an invalid JSON response.") from error
+
+    if not isinstance(result, dict):
+        raise RuntimeError("AgentGuard API returned an unexpected response.")
+    return result
+
+
+def run_demo(base_url: str, admin_token: str) -> None:
+    print("Creating a demo policy...")
+    policy = api_request(
+        base_url,
+        "/policies",
+        {
+            "max_transaction": "50",
+            "daily_limit": "100",
+            "allowed_recipients": ["0xDemoRecipient"],
+        },
+        admin_token,
+    )
+    policy_id = policy["policy_id"]
+    agent_token = policy["agent_token"]
+    print(f"Policy created: {policy_id}")
+    print("Agent token received and kept in memory (not displayed).")
+    print()
+
+    # This deterministic demo agent proposes two hypothetical actions.
+    proposals = (
+        ("Small transfer to an approved recipient", "25", "0xDemoRecipient"),
+        ("Transfer above the per-transaction limit", "75", "0xDemoRecipient"),
+    )
+
+    for description, amount, recipient in proposals:
+        print(f"Agent proposal: {description}")
+        print(f"  Amount: {amount}")
+        print(f"  Recipient: {recipient}")
+        decision = api_request(
+            base_url,
+            "/check-transaction",
+            {
+                "policy_id": policy_id,
+                "request_id": f"demo-{uuid.uuid4().hex}",
+                "amount": amount,
+                "recipient": recipient,
+            },
+            agent_token,
+        )
+        label = "ALLOW" if decision.get("allowed") is True else "DENY"
+        print(f"  AgentGuard: {label}")
+        print(f"  Reason: {decision.get('reason', 'No reason returned')}")
+        print()
+
+    print("Demo complete. No wallet was connected and no transaction was sent.")
+
+
+def main() -> int:
+    admin_token = os.getenv("AGENTGUARD_ADMIN_TOKEN", "")
+    if not admin_token:
+        print("Set AGENTGUARD_ADMIN_TOKEN before running this demo.")
+        return 1
+
+    try:
+        base_url = local_api_url(
+            os.getenv("AGENTGUARD_API_URL", "http://127.0.0.1:8000")
+        )
+        run_demo(base_url, admin_token)
+    except (ValueError, RuntimeError, URLError) as error:
+        print(f"Demo failed: {error}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
