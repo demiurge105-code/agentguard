@@ -1,6 +1,13 @@
+from pathlib import Path
+import runpy
+
 import pytest
 
-from examples.demo_agent import local_api_url
+
+DEMO_AGENT = runpy.run_path(
+    str(Path(__file__).resolve().parents[1] / "examples" / "demo_agent.py")
+)
+local_api_url = DEMO_AGENT["local_api_url"]
 
 
 def test_local_api_url_accepts_loopback_http():
