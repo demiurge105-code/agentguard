@@ -22,8 +22,10 @@ The current implementation includes:
 - Stable reason codes and human-readable explanations.
 - Decimal input validation, including rejection of `NaN`, `sNaN`, and positive or negative infinity.
 - SQLite storage for owner-created policies; monetary values are stored as decimal strings.
-- Owner-token-protected policy creation.
-- A FastAPI endpoint that evaluates requests against a stored policy.
+- Owner-token-protected policy creation and agent-token rotation.
+- Per-policy agent tokens; only SHA-256 token hashes are stored.
+- A FastAPI endpoint that authenticates an agent before evaluating a request.
+- Atomic server-side daily reservations and idempotent request handling.
 - Automated tests and pull-request CI.
 
 The engine checks rules in this order: maximum transaction amount, daily spending limit, then recipient allowlist. The first failed rule determines the denial reason.
@@ -103,7 +105,7 @@ Open the interactive API documentation at [http://127.0.0.1:8000/docs](http://12
 
 ### Configuration
 
-Set an owner token before creating policies. Keep it secret and do not commit it:
+Set an owner token before creating or rotating policies. Keep it secret and do not commit it:
 
 ```bash
 # macOS / Linux
@@ -115,11 +117,11 @@ $env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
 
 The SQLite database path can be changed with `AGENTGUARD_DB_PATH`. If unset, the application uses `agentguard.db` in the current working directory.
 
-If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation is disabled (fail closed).
+If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotation fail closed with HTTP 401.
 
 ### Create a policy
 
-`POST /policies` requires the owner token in the Authorization header:
+`POST /policies` requires the owner token:
 
 ```http
 POST /policies
@@ -133,13 +135,17 @@ Content-Type: application/json
 }
 ```
 
-The server generates and returns a `policy_id`. Policy values are stored in SQLite; monetary values are stored as decimal strings.
+The response includes a generated `policy_id` and an `agent_token`. **Save the agent token immediately:** the raw token is returned only when the policy is created or its token is rotated. AgentGuard stores only its SHA-256 hash in SQLite and does not provide a way to retrieve the raw token later.
 
 ### Check a transaction
 
-`POST /check-transaction` accepts only the policy ID and proposed transaction data:
+`POST /check-transaction` requires the agent token associated with the requested policy:
 
-```json
+```http
+POST /check-transaction
+Authorization: Bearer <agent-token>
+Content-Type: application/json
+
 {
   "policy_id": "<policy-id-returned-when-created>",
   "amount": "35",
@@ -148,7 +154,22 @@ The server generates and returns a `policy_id`. Policy values are stored in SQLi
 }
 ```
 
-The response contains `allowed`, `reason_code`, and `reason`. The endpoint loads policy limits and recipients from SQLite; callers cannot override them in the request. Unknown policy IDs return HTTP 404.
+The response contains `allowed`, `reason_code`, and `reason`. Missing, invalid, and cross-policy tokens return HTTP 401 without revealing whether the policy ID exists. The endpoint loads policy limits and recipients from SQLite; callers cannot override them in the request.
+
+### Rotate an agent token
+
+`POST /policies/{policy_id}/rotate-agent-token` requires the owner token:
+
+```http
+POST /policies/<policy-id>/rotate-agent-token
+Authorization: Bearer <your-admin-token>
+```
+
+The response contains the new `agent_token` once. Rotation replaces the stored hash immediately, so the previous token stops working. Save the new token securely.
+
+### Existing databases
+
+On startup, AgentGuard adds the nullable `agent_token_hash` column to an older SQLite `policies` table when needed. Existing policies are preserved, but they have no agent token and therefore cannot be used through `/check-transaction` until the owner rotates a token for each policy.
 
 ### Important security limitation
 
@@ -156,7 +177,7 @@ This is still a simulation interface, not a secure transaction-enforcement bound
 
 Daily usage is derived from SQLite reservations. Evaluation and reservation run in one serialized write transaction, so concurrent requests cannot collectively reserve more than the daily limit. Only allowed requests reserve budget; denied requests do not. Usage resets at 00:00 UTC. A reservation is budget allocated to an allowed simulated request, not proof that funds were spent or a transaction was broadcast; settlement and release are not implemented.
 
-The owner token protects policy creation; it does not authenticate callers of `/check-transaction` or bind a policy to a particular agent. Do not use this API as the sole control protecting real funds.
+Per-policy agent tokens authenticate access to the evaluation API. They do not prove that a caller is the legitimate wallet owner, and they do not stop an agent from bypassing AgentGuard entirely. Do not use this API as the sole control protecting real funds.
 
 ## Architecture
 
@@ -164,8 +185,8 @@ The current implementation consists of:
 
 - **Policy and request models** — validate policy limits, transaction amounts, and recipient identifiers.
 - **Policy engine** — evaluates a request and returns a deterministic decision.
-- **SQLite policy store** — persists owner-created policies separately from the policy engine.
-- **FastAPI interface** — exposes owner-authenticated policy creation and transaction evaluation.
+- **SQLite policy store** — persists policies, agent-token hashes, and daily reservations separately from the policy engine.
+- **FastAPI interface** — exposes owner-authenticated policy management and agent-authenticated transaction evaluation.
 - **Tests and examples** — demonstrate and verify the simulation behaviour.
 
 See [docs/architecture.md](docs/architecture.md) for more detail.
@@ -174,9 +195,9 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 
 Planned areas of work include:
 
-1. Reservation settlement/release and authenticated agent identities.
-2. A decision log and operational observability.
-3. A demo integration with an AI agent.
+1. Reservation settlement/release and a decision log.
+2. A reproducible demo integration with an AI agent.
+3. External developer feedback and security review.
 4. Further security design and isolated wallet or testnet integration research.
 
 The roadmap may change as the project is tested with developers and potential users.
@@ -198,9 +219,9 @@ This is an unfunded collaborative project. Participation is voluntary; there is 
 
 AgentGuard is experimental software and is not currently a wallet security system.
 
-It does not hold keys, sign transactions, submit transactions, or stop an agent from bypassing the API. The owner token is a basic shared-secret mechanism for policy creation, not a complete authentication or authorization system. Do not use an `ALLOW` decision as proof that a transaction is safe.
+It does not hold keys, sign transactions, submit transactions, or stop an agent from bypassing the API. Do not use an `ALLOW` decision as proof that a transaction is safe.
 
-Never commit private keys, seed phrases, API keys, or other secrets.
+Never commit private keys, seed phrases, API keys, owner tokens, or agent tokens.
 
 ## License
 
