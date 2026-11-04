@@ -119,6 +119,28 @@ The SQLite database path can be changed with `AGENTGUARD_DB_PATH`. If unset, the
 
 If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotation fail closed with HTTP 401.
 
+### Run the demo agent
+
+The repository includes a small deterministic demo agent. It creates a temporary policy through the API, proposes three simulated actions, and prints the `ALLOW` / `DENY` decisions. It uses only Python's standard library; no LLM API key or wallet is required.
+
+Start the API in one terminal with an owner token:
+
+```powershell
+$env:AGENTGUARD_ADMIN_TOKEN = "use-a-long-random-secret"
+uvicorn agentguard.api:app --reload
+```
+
+In a second terminal, set the same token and run the demo:
+
+```powershell
+$env:AGENTGUARD_ADMIN_TOKEN = "use-a-long-random-secret"
+python examples/agent_demo.py
+```
+
+On macOS or Linux, use `export AGENTGUARD_ADMIN_TOKEN="use-a-long-random-secret"` in both terminals before starting the API or running the script.
+
+The demo creates a new policy each time it runs. Its agent is deterministic rather than LLM-powered: this keeps the integration reproducible and free to run. All proposed actions are simulations; no wallet is connected and no funds move.
+
 ### Create a policy
 
 `POST /policies` requires the owner token:
@@ -234,7 +256,7 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 Planned areas of work include:
 
 1. Reservation settlement/release and a decision log.
-2. A reproducible demo integration with an AI agent.
+2. An LLM-backed agent adapter built on top of the deterministic API demo.
 3. External developer feedback and security review.
 4. Further security design and isolated wallet or testnet integration research.
 
