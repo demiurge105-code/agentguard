@@ -102,7 +102,7 @@ def test_api_request_rejects_invalid_json_response(monkeypatch):
 @pytest.mark.parametrize("body", [b"[]", b"null", b'"text"', b"123"])
 def test_api_request_rejects_non_object_json_response(monkeypatch, body):
     monkeypatch.setitem(
-        DEMO_AGENT,
+        api_request.__globals__,
         "urlopen",
         lambda request, timeout: FakeResponse(body),
     )
