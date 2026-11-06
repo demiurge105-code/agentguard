@@ -111,18 +111,25 @@ def test_api_request_rejects_non_object_json_response(monkeypatch, body):
         call_api_request()
 
 
-def test_run_demo_reports_missing_policy_id_without_printing_credentials(
-    monkeypatch, capsys
+@pytest.mark.parametrize(
+    ("policy_response", "missing_field"),
+    [
+        ({"agent_token": "agent-secret-token"}, "policy_id"),
+        ({"policy_id": "policy-1"}, "agent_token"),
+    ],
+)
+def test_run_demo_reports_missing_policy_fields_without_printing_credentials(
+    monkeypatch, capsys, policy_response, missing_field
 ):
     admin_token = "admin-secret-token"
     agent_token = "agent-secret-token"
     monkeypatch.setitem(
         DEMO_AGENT,
         "api_request",
-        lambda *args, **kwargs: {"agent_token": agent_token},
+        lambda *args, **kwargs: policy_response,
     )
 
-    with pytest.raises(KeyError, match="policy_id"):
+    with pytest.raises(KeyError, match=missing_field):
         run_demo("http://127.0.0.1:8000", admin_token)
 
     output = capsys.readouterr().out
