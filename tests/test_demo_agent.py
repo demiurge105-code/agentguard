@@ -76,7 +76,7 @@ def test_api_request_reports_http_error_without_exposing_bearer_token(monkeypatc
             fp=io.BytesIO(b'{"detail": "Request is forbidden"}'),
         )
 
-    monkeypatch.setitem(DEMO_AGENT, "urlopen", raise_http_error)
+    monkeypatch.setitem(api_request.__globals__, "urlopen", raise_http_error)
 
     with pytest.raises(RuntimeError, match="HTTP 403") as error:
         call_api_request()
@@ -88,7 +88,7 @@ def test_api_request_reports_http_error_without_exposing_bearer_token(monkeypatc
 
 def test_api_request_rejects_invalid_json_response(monkeypatch):
     monkeypatch.setitem(
-        DEMO_AGENT,
+        api_request.__globals__,
         "urlopen",
         lambda request, timeout: FakeResponse(b"{not valid json"),
     )
@@ -124,7 +124,7 @@ def test_run_demo_reports_missing_policy_fields_without_printing_credentials(
     admin_token = "admin-secret-token"
     agent_token = "agent-secret-token"
     monkeypatch.setitem(
-        DEMO_AGENT,
+        run_demo.__globals__,
         "api_request",
         lambda *args, **kwargs: policy_response,
     )
@@ -146,11 +146,11 @@ def test_main_handles_connection_failure_without_printing_admin_token(
     def raise_connection_error(request, timeout):
         raise URLError("connection refused")
 
-    monkeypatch.setitem(DEMO_AGENT, "urlopen", raise_connection_error)
+    monkeypatch.setitem(main.__globals__, "urlopen", raise_connection_error)
 
     assert main() == 1
 
     output = capsys.readouterr().out
     assert "Demo failed:" in output
-    assert "connection refused" in output
+    assert "Connection refused" in output
     assert admin_token not in output
