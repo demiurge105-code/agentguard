@@ -156,6 +156,7 @@ python examples/demo_agent.py
 The demo creates a new policy on each run. It proposes one transaction within the per-transaction limit (expected: `ALLOW`) and one above that limit (expected: `DENY`). The returned agent token is kept in memory and is not printed. The script accepts only a local loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
 
 All proposals are simulations. The demo does not use an LLM, connect to a wallet, sign or broadcast transactions, or prevent an agent from bypassing the API.
+
 ### Create a policy
 
 `POST /policies` requires the owner token:
