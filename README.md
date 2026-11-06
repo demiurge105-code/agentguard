@@ -121,26 +121,41 @@ If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotatio
 
 ### Run the demo agent
 
-The repository includes a small deterministic demo agent. It creates a temporary policy through the API, proposes three simulated actions, and prints the `ALLOW` / `DENY` decisions. It uses only Python's standard library; no LLM API key or wallet is required.
+Use `examples/demo_agent.py` as the canonical API demo. It creates a policy through the local API, proposes two hypothetical transactions, and prints the resulting `ALLOW` / `DENY` decisions. The agent is deterministic and uses Python's standard library; no LLM API key or wallet is required.
 
-Start the API in one terminal with an owner token:
+Start the API from the repository root in one terminal. Set an owner token before starting it:
 
-```powershell
-$env:AGENTGUARD_ADMIN_TOKEN = "use-a-long-random-secret"
+```bash
+# macOS / Linux
+export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
 uvicorn agentguard.api:app --reload
 ```
 
-In a second terminal, set the same token and run the demo:
+Windows PowerShell:
 
 ```powershell
-$env:AGENTGUARD_ADMIN_TOKEN = "use-a-long-random-secret"
-python examples/agent_demo.py
+$env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
+uvicorn agentguard.api:app --reload
 ```
 
-On macOS or Linux, use `export AGENTGUARD_ADMIN_TOKEN="use-a-long-random-secret"` in both terminals before starting the API or running the script.
+In a second terminal, from the repository root, set the same owner token and run the demo:
 
-The demo creates a new policy each time it runs. Its agent is deterministic rather than LLM-powered: this keeps the integration reproducible and free to run. All proposed actions are simulations; no wallet is connected and no funds move.
+```bash
+# macOS / Linux
+export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
+python examples/demo_agent.py
+```
 
+Windows PowerShell:
+
+```powershell
+$env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
+python examples/demo_agent.py
+```
+
+The demo creates a new policy on each run. It proposes one transaction within the per-transaction limit (expected: `ALLOW`) and one above that limit (expected: `DENY`). The returned agent token is kept in memory and is not printed. The script accepts only a local loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+
+All proposals are simulations. The demo does not use an LLM, connect to a wallet, sign or broadcast transactions, or prevent an agent from bypassing the API.
 ### Create a policy
 
 `POST /policies` requires the owner token:
@@ -192,44 +207,6 @@ The response contains the new `agent_token` once. Rotation replaces the stored h
 ### Existing databases
 
 On startup, AgentGuard adds the nullable `agent_token_hash` column to an older SQLite `policies` table when needed. Existing policies are preserved, but they have no agent token and therefore cannot be used through `/check-transaction` until the owner rotates a token for each policy.
-
-### Run the demo agent
-
-The demo agent is a deterministic Python script, not an LLM. It creates a temporary-use policy through the local API, receives a per-policy agent token, and proposes two hypothetical transactions: one within the policy and one above the per-transaction limit.
-
-Start the API in one terminal (set the same owner token in the terminal where the API runs):
-
-```bash
-# macOS / Linux
-export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
-uvicorn agentguard.api:app --reload
-```
-
-Windows PowerShell:
-
-```powershell
-$env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
-uvicorn agentguard.api:app --reload
-```
-
-In a second terminal, from the repository root, set the same owner token and run the demo:
-
-```bash
-# macOS / Linux
-export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
-python examples/demo_agent.py
-```
-
-Windows PowerShell:
-
-```powershell
-$env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
-python examples/demo_agent.py
-```
-
-The script prints the policy decision and reason for each proposal. It keeps the returned agent token in memory and does not print it. Each run creates a new policy in the configured SQLite database. The demo accepts only a local loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
-
-This example demonstrates the API integration flow only. It does not use an LLM, connect to a wallet, sign or broadcast transactions, or enforce policy against an agent that bypasses the API.
 
 ### Important security limitation
 
