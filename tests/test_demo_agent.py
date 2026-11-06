@@ -1,5 +1,8 @@
+import io
+import json
 from pathlib import Path
 import runpy
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -29,11 +32,6 @@ def test_local_api_url_accepts_loopback_http():
 def test_local_api_url_rejects_non_local_or_ambiguous_urls(value):
     with pytest.raises(ValueError):
         local_api_url(value)
-
-
-import io
-import json
-from urllib.error import HTTPError, URLError
 
 
 api_request = DEMO_AGENT["api_request"]
