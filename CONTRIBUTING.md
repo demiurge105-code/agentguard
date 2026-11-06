@@ -41,8 +41,10 @@ Build a policy engine that can:
 6. Submit a pull request explaining the change and the tests you ran.
 
 If an issue already has an open pull request or another contributor has
-claimed it, choose a different issue instead. The next maintainer-ready
-starter task is available as an [issue draft](docs/starter-task-non-finite-decimals.md).
+claimed it, choose a different issue instead. Browse the current [good first
+issues](https://github.com/demiurge105-code/agentguard/labels/good%20first%20issue)
+for available starter tasks; issue availability can change, so check its status
+and discussion before beginning.
 
 ## Local setup
 
