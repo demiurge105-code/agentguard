@@ -152,5 +152,5 @@ def test_main_handles_connection_failure_without_printing_admin_token(
 
     output = capsys.readouterr().out
     assert "Demo failed:" in output
-    assert "Connection refused" in output
+    assert "connection refused" in output.lower()
     assert admin_token not in output
