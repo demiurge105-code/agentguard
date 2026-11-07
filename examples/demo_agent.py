@@ -6,6 +6,8 @@ Start the API first, then run: python examples/demo_agent.py
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import os
 import uuid
 from urllib.error import HTTPError, URLError
@@ -71,11 +73,48 @@ def api_request(
     return result
 
 
-def simulate_execution(description: str, amount: str, recipient: str) -> None:
+@dataclass(frozen=True)
+class TransactionIntent:
+    """Immutable transaction data shared by the policy check and executor."""
+
+    description: str
+    amount: Decimal
+    recipient: str
+
+    def __init__(
+        self,
+        description: str,
+        amount: Decimal | str,
+        recipient: str,
+    ) -> None:
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("description must not be empty.")
+        if isinstance(amount, (bool, float)):
+            raise ValueError("amount must be a Decimal or decimal string, not a float.")
+        try:
+            parsed_amount = Decimal(amount)
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError("amount must be a valid decimal value.") from error
+        if not parsed_amount.is_finite() or parsed_amount <= 0:
+            raise ValueError("amount must be a finite decimal value greater than zero.")
+        if not isinstance(recipient, str) or not recipient.strip():
+            raise ValueError("recipient must not be empty.")
+
+        object.__setattr__(self, "description", description.strip())
+        object.__setattr__(self, "amount", parsed_amount)
+        object.__setattr__(self, "recipient", recipient.strip())
+
+    @property
+    def amount_text(self) -> str:
+        """Return an exact, non-exponent decimal representation for the API."""
+        return format(self.amount, "f")
+
+
+def simulate_execution(intent: TransactionIntent) -> None:
     """Represent a downstream executor without performing external side effects."""
     print(
-        f"  Simulated executor: would execute {amount} units "
-        f"to {recipient} ({description})."
+        f"  Simulated executor: would execute {intent.amount_text} units "
+        f"to {intent.recipient} ({intent.description})."
     )
 
 
@@ -99,22 +138,26 @@ def run_demo(base_url: str, admin_token: str) -> None:
 
     # This deterministic demo agent proposes hypothetical actions.
     proposals = (
-        ("Small transfer to an approved recipient", "25", "0xDemoRecipient"),
-        ("Transfer above the per-transaction limit", "75", "0xDemoRecipient"),
+        TransactionIntent(
+            "Small transfer to an approved recipient", "25", "0xDemoRecipient"
+        ),
+        TransactionIntent(
+            "Transfer above the per-transaction limit", "75", "0xDemoRecipient"
+        ),
     )
 
-    for description, amount, recipient in proposals:
-        print(f"Agent proposal: {description}")
-        print(f"  Amount: {amount}")
-        print(f"  Recipient: {recipient}")
+    for intent in proposals:
+        print(f"Agent proposal: {intent.description}")
+        print(f"  Amount: {intent.amount_text}")
+        print(f"  Recipient: {intent.recipient}")
         decision = api_request(
             base_url,
             "/check-transaction",
             {
                 "policy_id": policy_id,
                 "request_id": f"demo-{uuid.uuid4().hex}",
-                "amount": amount,
-                "recipient": recipient,
+                "amount": intent.amount_text,
+                "recipient": intent.recipient,
             },
             agent_token,
         )
@@ -125,7 +168,7 @@ def run_demo(base_url: str, admin_token: str) -> None:
 
         # Fail closed: only the literal boolean True reaches the simulated executor.
         if allowed:
-            simulate_execution(description, amount, recipient)
+            simulate_execution(intent)
         else:
             print("  Simulated executor: skipped (AgentGuard did not explicitly allow).")
         print()

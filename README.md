@@ -123,6 +123,8 @@ If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotatio
 
 Use `examples/demo_agent.py` as the canonical API demo. It creates a policy through the local API and proposes two hypothetical transactions. For each proposal, it asks AgentGuard for a decision before reaching the simulated executor:
 
+Each proposal is represented by a frozen `TransactionIntent` containing its description, exact `Decimal` amount, and recipient. The API check payload is built from that object, and the simulated executor receives the same object rather than separately reconstructed values. This demonstrates in-process intent consistency; it is not a cryptographic authorization proof and does not prevent a malicious agent from bypassing the demo flow.
+
 - If the response contains the literal boolean `"allowed": true`, the demo prints that the simulated action would execute.
 - If AgentGuard returns `DENY`, omits the `allowed` field, or returns a non-boolean value, the simulated executor is skipped.
 - If the API request fails or returns an invalid response, the demo stops without simulating execution.

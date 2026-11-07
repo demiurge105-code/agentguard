@@ -13,6 +13,8 @@ AgentGuard is an experimental, simulation-only policy evaluation service for pro
 5. The SQLite store serializes evaluation and reservation in a write transaction.
 6. The API returns an `ALLOW` or `DENY` decision with a stable reason code.
 
+The deterministic demo uses a frozen `TransactionIntent` value object for each proposal. Its `Decimal` amount and recipient are serialized into the API check request, and the same object is passed to the simulated executor only after an explicit boolean `allowed: true`. This keeps the checked values and simulated values aligned within the cooperative demo process. It does not create a server-verifiable approval token, isolate the executor, or prevent an agent with another execution path from bypassing AgentGuard.
+
 ## Components
 
 ### Policy Engine
