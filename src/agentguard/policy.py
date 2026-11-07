@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Iterable
@@ -63,6 +63,7 @@ class TransactionRequest:
     amount: Decimal
     recipient: str
     daily_spent: Decimal
+    _raw_recipient: str = field(repr=False, compare=False)
 
     def __init__(
         self,
@@ -83,6 +84,7 @@ class TransactionRequest:
         # Preserve the public legacy behavior; chain-aware validation runs again
         # against the policy before the recipient is compared with its allowlist.
         object.__setattr__(self, "recipient", recipient.strip().lower())
+        object.__setattr__(self, "_raw_recipient", recipient.strip())
         object.__setattr__(self, "daily_spent", spent_today)
 
 
@@ -110,7 +112,7 @@ def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
     than one rule fails.
     """
 
-    recipient = normalize_recipient(request.recipient, policy.chain_id)
+    recipient = normalize_recipient(request._raw_recipient, policy.chain_id)
     if request.amount > policy.max_transaction:
         return _deny(
             DecisionReason.AMOUNT_EXCEEDS_MAXIMUM,
