@@ -230,3 +230,46 @@ def test_authenticated_idempotent_retry_requires_current_token(tmp_path):
     assert store.evaluate_and_reserve_authenticated(
         policy_id, new_token, "60", "Alice", "same-request"
     ) == first
+
+
+def test_concurrent_rotation_and_authenticated_reservation_are_serialized(tmp_path):
+    import hashlib
+    from threading import Barrier
+
+    store = SQLitePolicyStore(tmp_path / "rotation-race.db")
+    old_token = "old-agent-token"
+    new_token = "new-agent-token"
+    policy_id = store.create_policy(
+        make_policy("500"),
+        hashlib.sha256(old_token.encode("utf-8")).hexdigest(),
+    )
+    start = Barrier(3)
+
+    def reserve_with_old_token():
+        start.wait()
+        return store.evaluate_and_reserve_authenticated(
+            policy_id, old_token, "10", "Alice", "racing-request"
+        )
+
+    def rotate():
+        start.wait()
+        return store.rotate_agent_token(
+            policy_id, hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reserve_future = pool.submit(reserve_with_old_token)
+        rotate_future = pool.submit(rotate)
+        start.wait()
+        reservation = reserve_future.result()
+        assert rotate_future.result() is True
+
+    # The in-flight request either committed before rotation or observed the
+    # replacement token. Once rotation returns, the old token must always fail.
+    assert reservation is None or reservation.allowed
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "10", "Alice", "after-rotation-old"
+    ) is None
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, new_token, "10", "Alice", "after-rotation-new"
+    ) is not None
