@@ -135,19 +135,34 @@ def test_evm_storage_rejects_malformed_recipient_before_reserving(tmp_path):
 
 
 def test_existing_schema_migrates_chain_id_as_legacy(tmp_path):
+    import sqlite3
+
     path = tmp_path / "before-chain-id.db"
-    store = SQLitePolicyStore(path)
-    policy_id = store.create_policy(make_policy())
-    connection = store._connect()
+    connection = sqlite3.connect(path)
     try:
-        connection.execute("ALTER TABLE policies DROP COLUMN chain_id")
+        connection.execute(
+            """CREATE TABLE policies (
+                policy_id TEXT PRIMARY KEY,
+                max_transaction TEXT NOT NULL,
+                daily_limit TEXT NOT NULL,
+                allowed_recipients TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                agent_token_hash TEXT
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO policies VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-policy", "100", "200", '["alice"]', "2026-11-07T00:00:00+00:00", None),
+        )
         connection.commit()
     finally:
         connection.close()
 
     migrated = SQLitePolicyStore(path)
-    policy = migrated.get_policy(policy_id)
+    policy = migrated.get_policy("legacy-policy")
 
     assert policy is not None
     assert policy.chain_id is None
-    assert migrated.evaluate_and_reserve(policy_id, "10", "ALICE", "legacy").allowed
+    assert migrated.evaluate_and_reserve(
+        "legacy-policy", "10", "ALICE", "legacy"
+    ).allowed
