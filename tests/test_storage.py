@@ -275,7 +275,6 @@ def test_concurrent_rotation_and_authenticated_reservation_are_serialized(tmp_pa
     ) is not None
 
 
-
 def test_in_memory_database_is_rejected():
     with pytest.raises(ValueError, match="file-based database path"):
         SQLitePolicyStore(":memory:")
