@@ -84,3 +84,70 @@ def test_concurrent_retries_with_same_request_id_reserve_budget_once(tmp_path):
     )
     assert not next_request.allowed
     assert next_request.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
+
+
+def test_evm_chain_id_and_canonical_allowlist_persist(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "evm.db")
+    address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    policy_id = store.create_policy(
+        Policy("100", "200", [address], chain_id="eip155:8453")
+    )
+
+    loaded = store.get_policy(policy_id)
+
+    assert loaded is not None
+    assert loaded.chain_id == "eip155:8453"
+    assert loaded.allowed_recipients == frozenset({address.lower()})
+
+
+def test_evm_idempotency_compares_canonical_addresses(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "evm.db")
+    address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    policy_id = store.create_policy(
+        Policy("100", "100", [address], chain_id="eip155:1")
+    )
+
+    first = store.evaluate_and_reserve(policy_id, "60", address, "same")
+    replay = store.evaluate_and_reserve(policy_id, "60", address.lower(), "same")
+    next_request = store.evaluate_and_reserve(
+        policy_id, "50", address, "after-replay"
+    )
+
+    assert first == replay
+    assert first.allowed is True
+    assert next_request.allowed is False
+    assert next_request.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
+
+
+def test_evm_storage_rejects_malformed_recipient_before_reserving(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "evm.db")
+    address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    policy_id = store.create_policy(
+        Policy("100", "200", [address], chain_id="eip155:1")
+    )
+
+    with pytest.raises(ValueError, match="20-byte hexadecimal"):
+        store.evaluate_and_reserve(policy_id, "10", "Alice", "invalid")
+
+    # The rejected input did not create an idempotency record.
+    allowed = store.evaluate_and_reserve(policy_id, "10", address, "invalid")
+    assert allowed.allowed is True
+
+
+def test_existing_schema_migrates_chain_id_as_legacy(tmp_path):
+    path = tmp_path / "before-chain-id.db"
+    store = SQLitePolicyStore(path)
+    policy_id = store.create_policy(make_policy())
+    connection = store._connect()
+    try:
+        connection.execute("ALTER TABLE policies DROP COLUMN chain_id")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SQLitePolicyStore(path)
+    policy = migrated.get_policy(policy_id)
+
+    assert policy is not None
+    assert policy.chain_id is None
+    assert migrated.evaluate_and_reserve(policy_id, "10", "ALICE", "legacy").allowed
