@@ -487,3 +487,22 @@ async def test_check_evm_policy_rejects_malformed_recipient(app, admin_token):
         )
 
     assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_check_transaction_uses_atomic_storage_authentication(app, admin_token, monkeypatch):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+
+        def separate_authentication_must_not_be_used(*args, **kwargs):
+            raise AssertionError("API must not authenticate outside the reservation transaction")
+
+        monkeypatch.setattr(
+            app.state.store, "authenticate_agent", separate_authentication_must_not_be_used
+        )
+        response = await check(
+            client, created["policy_id"], "atomic-auth", created["agent_token"]
+        )
+
+    assert response.status_code == 200
+    assert response.json()["allowed"] is True
