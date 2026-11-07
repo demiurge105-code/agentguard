@@ -71,6 +71,14 @@ def api_request(
     return result
 
 
+def simulate_execution(description: str, amount: str, recipient: str) -> None:
+    """Represent a downstream executor without performing external side effects."""
+    print(
+        f"  Simulated executor: would execute {amount} units "
+        f"to {recipient} ({description})."
+    )
+
+
 def run_demo(base_url: str, admin_token: str) -> None:
     print("Creating a demo policy...")
     policy = api_request(
@@ -89,7 +97,7 @@ def run_demo(base_url: str, admin_token: str) -> None:
     print("Agent token received and kept in memory (not displayed).")
     print()
 
-    # This deterministic demo agent proposes two hypothetical actions.
+    # This deterministic demo agent proposes hypothetical actions.
     proposals = (
         ("Small transfer to an approved recipient", "25", "0xDemoRecipient"),
         ("Transfer above the per-transaction limit", "75", "0xDemoRecipient"),
@@ -110,9 +118,16 @@ def run_demo(base_url: str, admin_token: str) -> None:
             },
             agent_token,
         )
-        label = "ALLOW" if decision.get("allowed") is True else "DENY"
+        allowed = decision.get("allowed") is True
+        label = "ALLOW" if allowed else "DENY"
         print(f"  AgentGuard: {label}")
         print(f"  Reason: {decision.get('reason', 'No reason returned')}")
+
+        # Fail closed: only the literal boolean True reaches the simulated executor.
+        if allowed:
+            simulate_execution(description, amount, recipient)
+        else:
+            print("  Simulated executor: skipped (AgentGuard did not explicitly allow).")
         print()
 
     print("Demo complete. No wallet was connected and no transaction was sent.")

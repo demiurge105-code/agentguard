@@ -121,7 +121,13 @@ If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotatio
 
 ### Run the demo agent
 
-Use `examples/demo_agent.py` as the canonical API demo. It creates a policy through the local API, proposes two hypothetical transactions, and prints the resulting `ALLOW` / `DENY` decisions. The agent is deterministic and uses Python's standard library; no LLM API key or wallet is required.
+Use `examples/demo_agent.py` as the canonical API demo. It creates a policy through the local API and proposes two hypothetical transactions. For each proposal, it asks AgentGuard for a decision before reaching the simulated executor:
+
+- If the response contains the literal boolean `"allowed": true`, the demo prints that the simulated action would execute.
+- If AgentGuard returns `DENY`, omits the `allowed` field, or returns a non-boolean value, the simulated executor is skipped.
+- If the API request fails or returns an invalid response, the demo stops without simulating execution.
+
+The agent is deterministic and uses Python's standard library; no LLM API key or wallet is required.
 
 Start the API from the repository root in one terminal. Set an owner token before starting it:
 
@@ -155,7 +161,7 @@ python examples/demo_agent.py
 
 The demo creates a new policy on each run. It proposes one transaction within the per-transaction limit (expected: `ALLOW`) and one above that limit (expected: `DENY`). The returned agent token is kept in memory and is not printed. The script accepts only a local loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
 
-All proposals are simulations. The demo does not use an LLM, connect to a wallet, sign or broadcast transactions, or prevent an agent from bypassing the API.
+All proposals and executor actions are simulations. The demo does not use an LLM, connect to a wallet, sign or broadcast transactions, or prevent an agent from bypassing the API. The executor is deliberately a print-only placeholder, not a production transaction adapter.
 
 ### Create a policy
 
