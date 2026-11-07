@@ -9,8 +9,9 @@ from decimal import Decimal
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agentguard.chains import normalize_chain_id, normalize_recipient
 from agentguard.policy import Policy
 from agentguard.storage import IdempotencyConflict, SQLitePolicyStore
 
@@ -21,6 +22,7 @@ class PolicyInput(BaseModel):
     max_transaction: Decimal = Field(ge=0)
     daily_limit: Decimal = Field(ge=0)
     allowed_recipients: list[str]
+    chain_id: str | None = None
 
     @field_validator("max_transaction", "daily_limit")
     @classmethod
@@ -35,6 +37,17 @@ class PolicyInput(BaseModel):
         if any(not recipient.strip() for recipient in values):
             raise ValueError("Allowed recipients must not contain empty values.")
         return values
+
+    @field_validator("chain_id")
+    @classmethod
+    def validate_chain_id(cls, value: str | None) -> str | None:
+        return normalize_chain_id(value)
+
+    @model_validator(mode="after")
+    def validate_recipients_for_chain(self) -> "PolicyInput":
+        for recipient in self.allowed_recipients:
+            normalize_recipient(recipient, self.chain_id)
+        return self
 
 
 class TransactionInput(BaseModel):
@@ -126,6 +139,7 @@ def create_app(
             data.max_transaction,
             data.daily_limit,
             data.allowed_recipients,
+            chain_id=data.chain_id,
         )
         agent_token = secrets.token_urlsafe(32)
         policy_id = get_store().create_policy(policy, _token_hash(agent_token))
@@ -134,6 +148,7 @@ def create_app(
             "max_transaction": str(policy.max_transaction),
             "daily_limit": str(policy.daily_limit),
             "allowed_recipients": sorted(policy.allowed_recipients),
+            "chain_id": policy.chain_id,
             "agent_token": agent_token,
         }
 
@@ -175,6 +190,8 @@ def create_app(
             )
         except IdempotencyConflict as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         if decision is None:
             # Defensive: policy may have been deleted between authentication and use.
             raise HTTPException(status_code=401, detail="Invalid or missing agent token.")
