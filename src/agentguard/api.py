@@ -143,14 +143,16 @@ def create_app(
         )
         agent_token = secrets.token_urlsafe(32)
         policy_id = get_store().create_policy(policy, _token_hash(agent_token))
-        return {
+        response: dict[str, object] = {
             "policy_id": policy_id,
             "max_transaction": str(policy.max_transaction),
             "daily_limit": str(policy.daily_limit),
             "allowed_recipients": sorted(policy.allowed_recipients),
-            "chain_id": policy.chain_id,
             "agent_token": agent_token,
         }
+        if policy.chain_id is not None:
+            response["chain_id"] = policy.chain_id
+        return response
 
     @application.post("/policies/{policy_id}/rotate-agent-token")
     def rotate_agent_token(
