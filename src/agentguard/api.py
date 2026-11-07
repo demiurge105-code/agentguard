@@ -192,7 +192,7 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         if decision is None:
-            # Defensive: policy may have been deleted between authentication and use.
+            # Do not reveal whether the policy ID exists or the token is invalid.
             raise HTTPException(status_code=401, detail="Invalid or missing agent token.")
         return decision.to_dict()
 
