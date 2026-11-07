@@ -273,3 +273,16 @@ def test_concurrent_rotation_and_authenticated_reservation_are_serialized(tmp_pa
     assert store.evaluate_and_reserve_authenticated(
         policy_id, new_token, "10", "Alice", "after-rotation-new"
     ) is not None
+
+
+
+def test_in_memory_database_is_rejected():
+    with pytest.raises(ValueError, match="file-based database path"):
+        SQLitePolicyStore(":memory:")
+
+
+def test_path_object_for_in_memory_database_is_rejected():
+    from pathlib import Path
+
+    with pytest.raises(ValueError, match="file-based database path"):
+        SQLitePolicyStore(Path(":memory:"))
