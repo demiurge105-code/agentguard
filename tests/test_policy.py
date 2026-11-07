@@ -226,3 +226,39 @@ def test_rejects_nonfinite_decimal_values(value: Decimal | str, field: str) -> N
         daily_spent = value if field == "daily_spent" else "0"
         with pytest.raises(ValueError, match=f"{field} must be a finite decimal value"):
             TransactionRequest(amount, "0xABC", daily_spent)
+
+
+def test_evm_policy_normalizes_allowed_and_requested_addresses():
+    allowed = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    policy = Policy("50", "200", [allowed], chain_id="eip155:1")
+
+    decision = check_transaction(
+        TransactionRequest("10", allowed.lower(), "0"),
+        policy,
+    )
+
+    assert decision.allowed is True
+    assert policy.chain_id == "eip155:1"
+    assert policy.allowed_recipients == frozenset({allowed.lower()})
+
+
+def test_evm_policy_rejects_malformed_allowlist_address():
+    with pytest.raises(ValueError, match="20-byte hexadecimal"):
+        Policy("50", "200", ["not-an-address"], chain_id="eip155:1")
+
+
+def test_evm_policy_rejects_malformed_transaction_address():
+    policy = Policy(
+        "50",
+        "200",
+        ["0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"],
+        chain_id="eip155:1",
+    )
+
+    with pytest.raises(ValueError, match="20-byte hexadecimal"):
+        check_transaction(TransactionRequest("10", "Alice", "0"), policy)
+
+
+def test_policy_rejects_unsupported_chain_namespace():
+    with pytest.raises(ValueError, match="chain_id"):
+        Policy("50", "200", ["Alice"], chain_id="solana:mainnet")
