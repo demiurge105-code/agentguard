@@ -112,6 +112,77 @@ def test_api_request_rejects_non_object_json_response(monkeypatch, body):
 
 
 @pytest.mark.parametrize(
+    ("allowed", "expected_execution_count"),
+    [
+        (True, 1),
+        (False, 0),
+        (None, 0),
+        ("true", 0),
+        (1, 0),
+    ],
+)
+def test_run_demo_only_executes_after_explicit_allow(
+    monkeypatch, capsys, allowed, expected_execution_count
+):
+    decisions = iter(
+        [
+            {"allowed": allowed, "reason": "first decision"},
+            {"allowed": False, "reason": "second decision"},
+        ]
+    )
+    executions = []
+
+    def fake_api_request(base_url, path, payload, token):
+        if path == "/policies":
+            return {"policy_id": "policy-1", "agent_token": "agent-secret-token"}
+        return next(decisions)
+
+    monkeypatch.setitem(run_demo.__globals__, "api_request", fake_api_request)
+    monkeypatch.setitem(
+        run_demo.__globals__,
+        "simulate_execution",
+        lambda description, amount, recipient: executions.append(
+            (description, amount, recipient)
+        ),
+    )
+
+    run_demo("http://127.0.0.1:8000", "admin-secret-token")
+
+    assert len(executions) == expected_execution_count
+    if expected_execution_count:
+        assert executions == [
+            (
+                "Small transfer to an approved recipient",
+                "25",
+                "0xDemoRecipient",
+            )
+        ]
+    output = capsys.readouterr().out
+    assert "Simulated executor: skipped" in output
+
+
+def test_run_demo_does_not_execute_when_agentguard_request_fails(monkeypatch):
+    executions = []
+
+    def failing_api_request(base_url, path, payload, token):
+        if path == "/policies":
+            return {"policy_id": "policy-1", "agent_token": "agent-secret-token"}
+        raise RuntimeError("AgentGuard unavailable")
+
+    monkeypatch.setitem(run_demo.__globals__, "api_request", failing_api_request)
+    monkeypatch.setitem(
+        run_demo.__globals__,
+        "simulate_execution",
+        lambda *args: executions.append(args),
+    )
+
+    with pytest.raises(RuntimeError, match="AgentGuard unavailable"):
+        run_demo("http://127.0.0.1:8000", "admin-secret-token")
+
+    assert executions == []
+
+
+@pytest.mark.parametrize(
     ("policy_response", "missing_field"),
     [
         ({"agent_token": "agent-secret-token"}, "policy_id"),
