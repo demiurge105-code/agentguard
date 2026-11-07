@@ -80,8 +80,9 @@ class TransactionRequest:
             raise ValueError("recipient identifiers must not be empty.")
 
         object.__setattr__(self, "amount", transaction_amount)
-        # Keep the original case until the policy's chain-specific rules apply.
-        object.__setattr__(self, "recipient", recipient.strip())
+        # Preserve the public legacy behavior; chain-aware validation runs again
+        # against the policy before the recipient is compared with its allowlist.
+        object.__setattr__(self, "recipient", recipient.strip().lower())
         object.__setattr__(self, "daily_spent", spent_today)
 
 
