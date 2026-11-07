@@ -28,8 +28,7 @@ class SQLitePolicyStore:
                 "':memory:' is not supported."
             )
         self.db_path = Path(db_path)
-        if str(db_path) != ":memory:":
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialise()
 
     def _connect(self) -> sqlite3.Connection:
