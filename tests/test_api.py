@@ -67,6 +67,7 @@ async def test_owner_can_create_policy_and_receives_agent_token(app, admin_token
     assert response.status_code == 201
     assert body["daily_limit"] == "500"
     assert body["allowed_recipients"] == ["alice", "bob"]
+    assert "chain_id" not in body  # Keep the legacy response shape unchanged.
     assert isinstance(body["agent_token"], str) and len(body["agent_token"]) >= 40
 
 
