@@ -267,3 +267,15 @@ def test_policy_rejects_unsupported_chain_namespace():
 def test_transaction_request_preserves_legacy_lowercase_recipient_behavior():
     request = TransactionRequest("10", "Alice", "0")
     assert request.recipient == "alice"
+
+
+def test_evm_policy_validates_original_recipient_before_legacy_normalization():
+    address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    policy = Policy("50", "200", [address], chain_id="eip155:1")
+    request = TransactionRequest("10", "0X" + address[2:], "0")
+
+    # The public legacy recipient field remains lowercase, but chain-aware
+    # validation uses the original input rather than that compatibility value.
+    assert request.recipient == ("0X" + address[2:]).lower()
+    with pytest.raises(ValueError, match="20-byte hexadecimal"):
+        check_transaction(request, policy)
