@@ -22,6 +22,11 @@ class SQLitePolicyStore:
     """Persist policies and serialize daily-budget reservations in SQLite."""
 
     def __init__(self, db_path: str | Path) -> None:
+        if str(db_path) == ":memory:":
+            raise ValueError(
+                "SQLitePolicyStore requires a file-based database path; "
+                "':memory:' is not supported."
+            )
         self.db_path = Path(db_path)
         if str(db_path) != ":memory:":
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
