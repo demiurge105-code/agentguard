@@ -47,9 +47,8 @@ class SQLitePolicyStore:
                         agent_token_hash TEXT
                     )"""
                 )
-                # Existing databases have the original five-column policies table.
-                # Add a nullable column so legacy policies remain readable but cannot
-                # authenticate an agent until the owner rotates their token.
+                # Add nullable columns when upgrading older databases. A missing
+                # chain_id keeps an existing policy in backwards-compatible legacy mode.
                 columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(policies)").fetchall()
