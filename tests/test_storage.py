@@ -166,3 +166,110 @@ def test_existing_schema_migrates_chain_id_as_legacy(tmp_path):
     assert migrated.evaluate_and_reserve(
         "legacy-policy", "10", "ALICE", "legacy"
     ).allowed
+
+
+def test_authenticated_reservation_checks_current_token_inside_transaction(tmp_path):
+    import hashlib
+
+    store = SQLitePolicyStore(tmp_path / "authenticated.db")
+    old_token = "old-agent-token"
+    new_token = "new-agent-token"
+    policy_id = store.create_policy(
+        make_policy("100"),
+        hashlib.sha256(old_token.encode("utf-8")).hexdigest(),
+    )
+
+    first = store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "authenticated"
+    )
+    assert first is not None and first.allowed
+
+    assert store.rotate_agent_token(
+        policy_id, hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+    )
+
+    # A request arriving with the revoked token after rotation cannot reserve.
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "10", "Alice", "revoked"
+    ) is None
+
+    # The replacement token remains usable and prior reservations still count.
+    denied = store.evaluate_and_reserve_authenticated(
+        policy_id, new_token, "50", "Bob", "new-token-request"
+    )
+    assert denied is not None
+    assert denied.allowed is False
+    assert denied.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
+
+
+def test_authenticated_idempotent_retry_requires_current_token(tmp_path):
+    import hashlib
+
+    store = SQLitePolicyStore(tmp_path / "authenticated-retry.db")
+    old_token = "old-agent-token"
+    new_token = "new-agent-token"
+    policy_id = store.create_policy(
+        make_policy("100"),
+        hashlib.sha256(old_token.encode("utf-8")).hexdigest(),
+    )
+
+    first = store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "same-request"
+    )
+    replay = store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "same-request"
+    )
+    assert first == replay
+
+    store.rotate_agent_token(
+        policy_id, hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+    )
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "same-request"
+    ) is None
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, new_token, "60", "Alice", "same-request"
+    ) == first
+
+
+def test_concurrent_rotation_and_authenticated_reservation_are_serialized(tmp_path):
+    import hashlib
+    from threading import Barrier
+
+    store = SQLitePolicyStore(tmp_path / "rotation-race.db")
+    old_token = "old-agent-token"
+    new_token = "new-agent-token"
+    policy_id = store.create_policy(
+        make_policy("500"),
+        hashlib.sha256(old_token.encode("utf-8")).hexdigest(),
+    )
+    start = Barrier(3)
+
+    def reserve_with_old_token():
+        start.wait()
+        return store.evaluate_and_reserve_authenticated(
+            policy_id, old_token, "10", "Alice", "racing-request"
+        )
+
+    def rotate():
+        start.wait()
+        return store.rotate_agent_token(
+            policy_id, hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reserve_future = pool.submit(reserve_with_old_token)
+        rotate_future = pool.submit(rotate)
+        start.wait()
+        reservation = reserve_future.result()
+        assert rotate_future.result() is True
+
+    # The in-flight request either committed before rotation or observed the
+    # replacement token. Once rotation returns, the old token must always fail.
+    assert reservation is None or reservation.allowed
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "10", "Alice", "after-rotation-old"
+    ) is None
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, new_token, "10", "Alice", "after-rotation-new"
+    ) is not None

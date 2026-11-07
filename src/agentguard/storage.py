@@ -176,7 +176,39 @@ class SQLitePolicyStore:
         request_id: str,
         now: datetime | None = None,
     ) -> Decision | None:
-        """Atomically evaluate and reserve allowed budget; not an on-chain spend."""
+        """Evaluate and reserve for trusted in-process callers.
+
+        API requests must use evaluate_and_reserve_authenticated so token
+        verification and reservation share one SQLite write transaction.
+        """
+        return self._evaluate_and_reserve(
+            policy_id, amount, recipient, request_id, now=now
+        )
+
+    def evaluate_and_reserve_authenticated(
+        self,
+        policy_id: str,
+        token: str,
+        amount: Decimal | str,
+        recipient: str,
+        request_id: str,
+        now: datetime | None = None,
+    ) -> Decision | None:
+        """Authenticate and reserve atomically; return None for invalid credentials."""
+        return self._evaluate_and_reserve(
+            policy_id, amount, recipient, request_id, now=now, agent_token=token
+        )
+
+    def _evaluate_and_reserve(
+        self,
+        policy_id: str,
+        amount: Decimal | str,
+        recipient: str,
+        request_id: str,
+        now: datetime | None = None,
+        agent_token: str | None = None,
+    ) -> Decision | None:
+        """Atomically authenticate (when supplied), evaluate, and reserve budget."""
         transaction_amount = Decimal(amount)
         utc_day = (
             (now or datetime.now(timezone.utc))
@@ -188,13 +220,20 @@ class SQLitePolicyStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             policy_row = connection.execute(
-                """SELECT max_transaction, daily_limit, allowed_recipients, chain_id
+                """SELECT max_transaction, daily_limit, allowed_recipients, chain_id,
+                          agent_token_hash
                 FROM policies WHERE policy_id = ?""",
                 (policy_id,),
             ).fetchone()
             if policy_row is None:
                 connection.commit()
                 return None
+            if agent_token is not None:
+                stored_hash = policy_row["agent_token_hash"]
+                supplied_hash = hashlib.sha256(agent_token.encode("utf-8")).hexdigest()
+                if not stored_hash or not hmac.compare_digest(stored_hash, supplied_hash):
+                    connection.commit()
+                    return None
             policy = self._policy(policy_row)
             normalised_recipient = normalize_recipient(recipient, policy.chain_id)
 

@@ -174,18 +174,15 @@ def create_app(
         authorization: str | None = Header(default=None),
     ) -> dict[str, object]:
         agent_token = _bearer_token(authorization)
-        if (
-            agent_token is None
-            or not get_store().authenticate_agent(data.policy_id, agent_token)
-        ):
-            # Do not reveal whether the policy ID exists.
+        if agent_token is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing agent token.",
             )
         try:
-            decision = get_store().evaluate_and_reserve(
+            decision = get_store().evaluate_and_reserve_authenticated(
                 data.policy_id,
+                agent_token,
                 data.amount,
                 data.recipient,
                 data.request_id,
@@ -195,7 +192,7 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         if decision is None:
-            # Defensive: policy may have been deleted between authentication and use.
+            # Do not reveal whether the policy ID exists or the token is invalid.
             raise HTTPException(status_code=401, detail="Invalid or missing agent token.")
         return decision.to_dict()
 
