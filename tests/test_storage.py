@@ -166,3 +166,67 @@ def test_existing_schema_migrates_chain_id_as_legacy(tmp_path):
     assert migrated.evaluate_and_reserve(
         "legacy-policy", "10", "ALICE", "legacy"
     ).allowed
+
+
+def test_authenticated_reservation_checks_current_token_inside_transaction(tmp_path):
+    import hashlib
+
+    store = SQLitePolicyStore(tmp_path / "authenticated.db")
+    old_token = "old-agent-token"
+    new_token = "new-agent-token"
+    policy_id = store.create_policy(
+        make_policy("100"),
+        hashlib.sha256(old_token.encode("utf-8")).hexdigest(),
+    )
+
+    first = store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "authenticated"
+    )
+    assert first is not None and first.allowed
+
+    assert store.rotate_agent_token(
+        policy_id, hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+    )
+
+    # A request arriving with the revoked token after rotation cannot reserve.
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "10", "Alice", "revoked"
+    ) is None
+
+    # The replacement token remains usable and prior reservations still count.
+    denied = store.evaluate_and_reserve_authenticated(
+        policy_id, new_token, "50", "Bob", "new-token-request"
+    )
+    assert denied is not None
+    assert denied.allowed is False
+    assert denied.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
+
+
+def test_authenticated_idempotent_retry_requires_current_token(tmp_path):
+    import hashlib
+
+    store = SQLitePolicyStore(tmp_path / "authenticated-retry.db")
+    old_token = "old-agent-token"
+    new_token = "new-agent-token"
+    policy_id = store.create_policy(
+        make_policy("100"),
+        hashlib.sha256(old_token.encode("utf-8")).hexdigest(),
+    )
+
+    first = store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "same-request"
+    )
+    replay = store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "same-request"
+    )
+    assert first == replay
+
+    store.rotate_agent_token(
+        policy_id, hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+    )
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, old_token, "60", "Alice", "same-request"
+    ) is None
+    assert store.evaluate_and_reserve_authenticated(
+        policy_id, new_token, "60", "Alice", "same-request"
+    ) == first
