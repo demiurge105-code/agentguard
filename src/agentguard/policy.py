@@ -109,6 +109,7 @@ def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
     than one rule fails.
     """
 
+    recipient = normalize_recipient(request.recipient, policy.chain_id)
     if request.amount > policy.max_transaction:
         return _deny(
             DecisionReason.AMOUNT_EXCEEDS_MAXIMUM,
@@ -119,7 +120,6 @@ def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
             DecisionReason.DAILY_LIMIT_EXCEEDED,
             "Transaction would exceed the daily spending limit.",
         )
-    recipient = normalize_recipient(request.recipient, policy.chain_id)
     if recipient not in policy.allowed_recipients:
         return _deny(
             DecisionReason.RECIPIENT_NOT_ALLOWED,
