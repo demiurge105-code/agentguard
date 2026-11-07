@@ -17,7 +17,7 @@ The current implementation includes:
 - A deterministic policy engine.
 - A maximum transaction amount check.
 - A daily spending limit check.
-- A recipient allowlist with case-insensitive recipient comparison.
+- A recipient allowlist with legacy case-insensitive identifiers and chain-aware EVM address validation when a policy specifies an EVM chain.
 - Structured `ALLOW` / `DENY` decisions.
 - Stable reason codes and human-readable explanations.
 - Decimal input validation, including rejection of `NaN`, `sNaN`, and positive or negative infinity.
@@ -175,6 +175,25 @@ Content-Type: application/json
 
 The response includes a generated `policy_id` and an `agent_token`. **Save the agent token immediately:** the raw token is returned only when the policy is created or its token is rotated. AgentGuard stores only its SHA-256 hash in SQLite and does not provide a way to retrieve the raw token later.
 
+### Chain-aware policies (EVM-first)
+
+New EVM policies can bind their allowlist to a CAIP-2 chain identifier. For example, use `chain_id: "eip155:1"` for Ethereum mainnet or `chain_id: "eip155:8453"` for Base. The chain is stored on the policy, so callers cannot override it on individual transaction checks.
+
+When `chain_id` is present, every allowed recipient and proposed recipient must be a 20-byte hexadecimal EVM address (`0x` followed by 40 hexadecimal characters). Addresses are normalized to lowercase before allowlist and idempotency comparisons. The current implementation validates address shape; it does not verify EIP-55 checksums, query a chain, or prove that the selected chain exists or is reachable.
+
+When `chain_id` is omitted, the policy remains in legacy mode and retains the previous case-insensitive arbitrary-identifier behavior. This preserves existing policies and integrations while new chain-aware integrations opt into EVM validation.
+
+Example policy payload:
+
+```json
+{
+  "max_transaction": "50",
+  "daily_limit": "200",
+  "chain_id": "eip155:8453",
+  "allowed_recipients": ["0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"]
+}
+```
+
 ### Check a transaction
 
 `POST /check-transaction` requires the agent token associated with the requested policy:
@@ -222,6 +241,7 @@ Per-policy agent tokens authenticate access to the evaluation API. They do not p
 The current implementation consists of:
 
 - **Policy and request models** — validate policy limits, transaction amounts, and recipient identifiers.
+- **Chain adapters** — validate EVM CAIP-2 chain identifiers and normalize EVM addresses; other chain namespaces are not implemented yet.
 - **Policy engine** — evaluates a request and returns a deterministic decision.
 - **SQLite policy store** — persists policies, agent-token hashes, and daily reservations separately from the policy engine.
 - **FastAPI interface** — exposes owner-authenticated policy management and agent-authenticated transaction evaluation.
