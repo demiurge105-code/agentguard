@@ -63,3 +63,24 @@ def test_concurrent_requests_cannot_over_reserve(tmp_path):
     def reserve(i): return s.evaluate_and_reserve(pid,"60","Alice",f"parallel-{i}")
     with ThreadPoolExecutor(max_workers=8) as pool: results=list(pool.map(reserve,range(8)))
     assert sum(x.allowed for x in results if x is not None)==1
+
+def test_concurrent_retries_with_same_request_id_reserve_budget_once(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "p.db")
+    policy_id = store.create_policy(make_policy("100"))
+
+    def reserve(_):
+        return store.evaluate_and_reserve(policy_id, "60", "Alice", "same-request")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(reserve, range(8)))
+
+    assert all(result == results[0] for result in results)
+    assert results[0].allowed
+
+    # A replay must not create another reservation: only 60 of the 100
+    # daily units are reserved, so a further request for 50 must be denied.
+    next_request = store.evaluate_and_reserve(
+        policy_id, "50", "Bob", "after-replay"
+    )
+    assert not next_request.allowed
+    assert next_request.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
