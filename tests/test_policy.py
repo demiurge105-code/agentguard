@@ -262,3 +262,8 @@ def test_evm_policy_rejects_malformed_transaction_address():
 def test_policy_rejects_unsupported_chain_namespace():
     with pytest.raises(ValueError, match="chain_id"):
         Policy("50", "200", ["Alice"], chain_id="solana:mainnet")
+
+
+def test_transaction_request_preserves_legacy_lowercase_recipient_behavior():
+    request = TransactionRequest("10", "Alice", "0")
+    assert request.recipient == "alice"
