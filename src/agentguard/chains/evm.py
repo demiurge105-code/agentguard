@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-_EVM_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}\\Z")
+_EVM_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 
 
 def normalize_evm_address(address: str) -> str:
