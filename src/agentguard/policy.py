@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Iterable
+
+from agentguard.chains import normalize_chain_id, normalize_recipient
 
 
 class DecisionReason(str, Enum):
@@ -21,29 +23,37 @@ class DecisionReason(str, Enum):
 class Policy:
     """Rules that apply to a simulated transaction.
 
-    Monetary values use ``Decimal`` to avoid float rounding errors. Recipient
-    identifiers are compared case-insensitively in this simulator.
+    Monetary values use Decimal to avoid float rounding errors. Recipient
+    normalization is selected by chain_id. Policies without a chain_id retain
+    the legacy case-insensitive identifier behavior.
     """
 
     max_transaction: Decimal
     daily_limit: Decimal
     allowed_recipients: frozenset[str]
+    chain_id: str | None
 
     def __init__(
         self,
         max_transaction: Decimal | str,
         daily_limit: Decimal | str,
         allowed_recipients: Iterable[str],
+        chain_id: str | None = None,
     ) -> None:
         max_amount = _as_decimal(max_transaction, "max_transaction")
         daily_amount = _as_decimal(daily_limit, "daily_limit")
         if max_amount < 0 or daily_amount < 0:
             raise ValueError("Policy limits must be non-negative.")
 
-        recipients = frozenset(_normalise_recipient(value) for value in allowed_recipients)
+        normalized_chain_id = normalize_chain_id(chain_id)
+        recipients = frozenset(
+            normalize_recipient(value, normalized_chain_id)
+            for value in allowed_recipients
+        )
         object.__setattr__(self, "max_transaction", max_amount)
         object.__setattr__(self, "daily_limit", daily_amount)
         object.__setattr__(self, "allowed_recipients", recipients)
+        object.__setattr__(self, "chain_id", normalized_chain_id)
 
 
 @dataclass(frozen=True)
@@ -53,6 +63,7 @@ class TransactionRequest:
     amount: Decimal
     recipient: str
     daily_spent: Decimal
+    _raw_recipient: str = field(repr=False, compare=False)
 
     def __init__(
         self,
@@ -66,9 +77,14 @@ class TransactionRequest:
             raise ValueError("amount must be greater than zero.")
         if spent_today < 0:
             raise ValueError("daily_spent must be non-negative.")
+        if not isinstance(recipient, str) or not recipient.strip():
+            raise ValueError("recipient identifiers must not be empty.")
 
         object.__setattr__(self, "amount", transaction_amount)
-        object.__setattr__(self, "recipient", _normalise_recipient(recipient))
+        # Preserve the public legacy behavior; chain-aware validation runs again
+        # against the policy before the recipient is compared with its allowlist.
+        object.__setattr__(self, "recipient", recipient.strip().lower())
+        object.__setattr__(self, "_raw_recipient", recipient.strip())
         object.__setattr__(self, "daily_spent", spent_today)
 
 
@@ -87,6 +103,7 @@ class Decision:
             "reason": self.reason,
         }
 
+
 def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
     """Evaluate a proposed transaction against a policy.
 
@@ -95,6 +112,7 @@ def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
     than one rule fails.
     """
 
+    recipient = normalize_recipient(request._raw_recipient, policy.chain_id)
     if request.amount > policy.max_transaction:
         return _deny(
             DecisionReason.AMOUNT_EXCEEDS_MAXIMUM,
@@ -105,7 +123,7 @@ def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
             DecisionReason.DAILY_LIMIT_EXCEEDED,
             "Transaction would exceed the daily spending limit.",
         )
-    if request.recipient not in policy.allowed_recipients:
+    if recipient not in policy.allowed_recipients:
         return _deny(
             DecisionReason.RECIPIENT_NOT_ALLOWED,
             "Recipient is not in the allowed-recipient list.",
@@ -126,12 +144,3 @@ def _as_decimal(value: Decimal | str, field_name: str) -> Decimal:
     if not amount.is_finite():
         raise ValueError(f"{field_name} must be a finite decimal value.")
     return amount
-
-
-def _normalise_recipient(value: str) -> str:
-    normalised = value.strip().lower()
-    if not normalised:
-        raise ValueError("recipient identifiers must not be empty.")
-    return normalised
-
-

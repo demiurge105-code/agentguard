@@ -67,6 +67,7 @@ async def test_owner_can_create_policy_and_receives_agent_token(app, admin_token
     assert response.status_code == 201
     assert body["daily_limit"] == "500"
     assert body["allowed_recipients"] == ["alice", "bob"]
+    assert "chain_id" not in body  # Keep the legacy response shape unchanged.
     assert isinstance(body["agent_token"], str) and len(body["agent_token"]) >= 40
 
 
@@ -395,3 +396,94 @@ def test_injected_store_does_not_create_default_database(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTGUARD_DB_PATH", str(path))
     create_app(SQLitePolicyStore(tmp_path / "injected.db"), "test-admin-token")
     assert not path.exists()
+
+
+@pytest.mark.anyio
+async def test_create_evm_policy_and_check_canonical_address(app, admin_token):
+    address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created_response = await create_policy(
+            client,
+            admin_token,
+            {
+                "max_transaction": "100",
+                "daily_limit": "500",
+                "allowed_recipients": [address],
+                "chain_id": "eip155:8453",
+            },
+        )
+        created = created_response.json()
+        response = await check(
+            client,
+            created["policy_id"],
+            "evm-case",
+            created["agent_token"],
+            recipient=address.lower(),
+        )
+
+    assert created_response.status_code == 201
+    assert created["chain_id"] == "eip155:8453"
+    assert created["allowed_recipients"] == [address.lower()]
+    assert response.status_code == 200
+    assert response.json()["allowed"] is True
+
+
+@pytest.mark.anyio
+async def test_create_evm_policy_rejects_malformed_allowlist_address(app, admin_token):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await create_policy(
+            client,
+            admin_token,
+            {
+                "max_transaction": "100",
+                "daily_limit": "500",
+                "allowed_recipients": ["Alice"],
+                "chain_id": "eip155:1",
+            },
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_create_policy_rejects_unsupported_chain_namespace(app, admin_token):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await create_policy(
+            client,
+            admin_token,
+            {
+                "max_transaction": "100",
+                "daily_limit": "500",
+                "allowed_recipients": ["Alice"],
+                "chain_id": "solana:mainnet",
+            },
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_check_evm_policy_rejects_malformed_recipient(app, admin_token):
+    address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (
+            await create_policy(
+                client,
+                admin_token,
+                {
+                    "max_transaction": "100",
+                    "daily_limit": "500",
+                    "allowed_recipients": [address],
+                    "chain_id": "eip155:1",
+                },
+            )
+        ).json()
+        response = await check(
+            client,
+            created["policy_id"],
+            "bad-evm-address",
+            created["agent_token"],
+            recipient="not-an-address",
+        )
+
+    assert response.status_code == 422
