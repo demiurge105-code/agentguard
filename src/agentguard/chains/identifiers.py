@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-_EIP155_CHAIN_ID = re.compile(r"eip155:(?:0|[1-9][0-9]{0,31})\\Z")
+_EIP155_CHAIN_ID = re.compile(r"eip155:(?:0|[1-9][0-9]{0,31})\Z")
 
 
 def normalize_chain_id(chain_id: str | None) -> str | None:
