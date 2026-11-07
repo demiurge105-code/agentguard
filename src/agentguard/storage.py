@@ -234,8 +234,6 @@ class SQLitePolicyStore:
                 if not stored_hash or not hmac.compare_digest(stored_hash, supplied_hash):
                     connection.commit()
                     return None
-                connection.commit()
-                return None
             policy = self._policy(policy_row)
             normalised_recipient = normalize_recipient(recipient, policy.chain_id)
 
