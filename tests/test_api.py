@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import sqlite3
 from datetime import datetime, timezone
@@ -268,6 +269,48 @@ async def test_api_retry_is_idempotent(app, admin_token):
         next_request = await check(client, created["policy_id"], "next", created["agent_token"], "250")
 
     assert first.json() == retry.json()
+    assert next_request.json()["reason_code"] == "daily_limit_exceeded"
+
+
+@pytest.mark.anyio
+async def test_concurrent_api_retries_with_same_request_id_reserve_once(app, admin_token):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (
+            await create_policy(
+                client,
+                admin_token,
+                {
+                    "max_transaction": "1000",
+                    "daily_limit": "500",
+                    "allowed_recipients": ["Alice", "Bob"],
+                },
+            )
+        ).json()
+
+        responses = await asyncio.gather(
+            *[
+                check(
+                    client,
+                    created["policy_id"],
+                    "concurrent-retry",
+                    created["agent_token"],
+                    "300",
+                )
+                for _ in range(8)
+            ]
+        )
+        next_request = await check(
+            client,
+            created["policy_id"],
+            "after-concurrent-retry",
+            created["agent_token"],
+            "250",
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert all(response.json() == responses[0].json() for response in responses)
+    assert responses[0].json()["allowed"] is True
+    assert next_request.status_code == 200
     assert next_request.json()["reason_code"] == "daily_limit_exceeded"
 
 
