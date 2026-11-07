@@ -141,22 +141,17 @@ def test_run_demo_only_executes_after_explicit_allow(
     monkeypatch.setitem(
         run_demo.__globals__,
         "simulate_execution",
-        lambda description, amount, recipient: executions.append(
-            (description, amount, recipient)
-        ),
+        lambda intent: executions.append(intent),
     )
 
     run_demo("http://127.0.0.1:8000", "admin-secret-token")
 
     assert len(executions) == expected_execution_count
     if expected_execution_count:
-        assert executions == [
-            (
-                "Small transfer to an approved recipient",
-                "25",
-                "0xDemoRecipient",
-            )
-        ]
+        assert len(executions) == 1
+        assert executions[0].description == "Small transfer to an approved recipient"
+        assert executions[0].amount_text == "25"
+        assert executions[0].recipient == "0xDemoRecipient"
     output = capsys.readouterr().out
     assert "Simulated executor: skipped" in output
 
@@ -173,7 +168,7 @@ def test_run_demo_does_not_execute_when_agentguard_request_fails(monkeypatch):
     monkeypatch.setitem(
         run_demo.__globals__,
         "simulate_execution",
-        lambda *args: executions.append(args),
+        lambda intent: executions.append(intent),
     )
 
     with pytest.raises(RuntimeError, match="AgentGuard unavailable"):
@@ -206,6 +201,62 @@ def test_run_demo_reports_missing_policy_fields_without_printing_credentials(
     output = capsys.readouterr().out
     assert admin_token not in output
     assert agent_token not in output
+
+
+
+TransactionIntent = DEMO_AGENT["TransactionIntent"]
+
+
+@pytest.mark.parametrize(
+    "amount",
+    ["NaN", "Infinity", "-Infinity", "0", "-1", 1.5, True, "not-a-number"],
+)
+def test_transaction_intent_rejects_invalid_amounts(amount):
+    with pytest.raises(ValueError):
+        TransactionIntent("Test transfer", amount, "0xRecipient")
+
+
+def test_transaction_intent_is_immutable_and_keeps_decimal_precision():
+    from dataclasses import FrozenInstanceError
+    from decimal import Decimal
+
+    intent = TransactionIntent(" Exact transfer ", "0.100000000000000001", " 0xRecipient ")
+
+    assert intent.description == "Exact transfer"
+    assert intent.amount == Decimal("0.100000000000000001")
+    assert intent.amount_text == "0.100000000000000001"
+    assert intent.recipient == "0xRecipient"
+
+    with pytest.raises(FrozenInstanceError):
+        intent.recipient = "0xAttacker"
+
+
+def test_run_demo_checks_and_executes_the_same_intent_object(monkeypatch):
+    captured_check_payloads = []
+    executed_intents = []
+
+    def fake_api_request(base_url, path, payload, token):
+        if path == "/policies":
+            return {"policy_id": "policy-1", "agent_token": "agent-secret-token"}
+        captured_check_payloads.append(payload)
+        return {"allowed": len(captured_check_payloads) == 1, "reason": "test"}
+
+    monkeypatch.setitem(run_demo.__globals__, "api_request", fake_api_request)
+    monkeypatch.setitem(
+        run_demo.__globals__,
+        "simulate_execution",
+        lambda intent: executed_intents.append(intent),
+    )
+
+    run_demo("http://127.0.0.1:8000", "admin-secret-token")
+
+    assert len(captured_check_payloads) == 2
+    assert len(executed_intents) == 1
+    executed_intent = executed_intents[0]
+    assert captured_check_payloads[0]["amount"] == executed_intent.amount_text
+    assert captured_check_payloads[0]["recipient"] == executed_intent.recipient
+    assert captured_check_payloads[1]["amount"] == "75"
+    assert captured_check_payloads[1]["recipient"] == "0xDemoRecipient"
 
 
 def test_main_handles_connection_failure_without_printing_admin_token(
