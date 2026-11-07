@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from agentguard.chains import normalize_recipient
 from agentguard.policy import Decision, DecisionReason, Policy, TransactionRequest, check_transaction
 
 
@@ -42,6 +43,7 @@ class SQLitePolicyStore:
                         daily_limit TEXT NOT NULL,
                         allowed_recipients TEXT NOT NULL,
                         created_at TEXT NOT NULL,
+                        chain_id TEXT,
                         agent_token_hash TEXT
                     )"""
                 )
@@ -55,6 +57,10 @@ class SQLitePolicyStore:
                 if "agent_token_hash" not in columns:
                     connection.execute(
                         "ALTER TABLE policies ADD COLUMN agent_token_hash TEXT"
+                    )
+                if "chain_id" not in columns:
+                    connection.execute(
+                        "ALTER TABLE policies ADD COLUMN chain_id TEXT"
                     )
 
                 connection.execute(
@@ -89,14 +95,15 @@ class SQLitePolicyStore:
                 connection.execute(
                     """INSERT INTO policies (
                         policy_id, max_transaction, daily_limit,
-                        allowed_recipients, created_at, agent_token_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        allowed_recipients, created_at, chain_id, agent_token_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         policy_id,
                         str(policy.max_transaction),
                         str(policy.daily_limit),
                         recipients,
                         created_at,
+                        policy.chain_id,
                         agent_token_hash,
                     ),
                 )
@@ -139,6 +146,7 @@ class SQLitePolicyStore:
             row["max_transaction"],
             row["daily_limit"],
             json.loads(row["allowed_recipients"]),
+            chain_id=row["chain_id"],
         )
 
     @staticmethod
@@ -153,7 +161,7 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             row = connection.execute(
-                """SELECT max_transaction, daily_limit, allowed_recipients
+                """SELECT max_transaction, daily_limit, allowed_recipients, chain_id
                 FROM policies WHERE policy_id = ?""",
                 (policy_id,),
             ).fetchone()
@@ -171,7 +179,6 @@ class SQLitePolicyStore:
     ) -> Decision | None:
         """Atomically evaluate and reserve allowed budget; not an on-chain spend."""
         transaction_amount = Decimal(amount)
-        normalised_recipient = recipient.strip().lower()
         utc_day = (
             (now or datetime.now(timezone.utc))
             .astimezone(timezone.utc)
@@ -181,6 +188,17 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            policy_row = connection.execute(
+                """SELECT max_transaction, daily_limit, allowed_recipients, chain_id
+                FROM policies WHERE policy_id = ?""",
+                (policy_id,),
+            ).fetchone()
+            if policy_row is None:
+                connection.commit()
+                return None
+            policy = self._policy(policy_row)
+            normalised_recipient = normalize_recipient(recipient, policy.chain_id)
+
             previous = connection.execute(
                 """SELECT amount, recipient, allowed, reason_code, reason
                 FROM daily_reservations WHERE policy_id = ? AND request_id = ?""",
@@ -198,15 +216,6 @@ class SQLitePolicyStore:
                 connection.commit()
                 return decision
 
-            policy_row = connection.execute(
-                """SELECT max_transaction, daily_limit, allowed_recipients
-                FROM policies WHERE policy_id = ?""",
-                (policy_id,),
-            ).fetchone()
-            if policy_row is None:
-                connection.commit()
-                return None
-            policy = self._policy(policy_row)
             usage = connection.execute(
                 """SELECT amount FROM daily_reservations
                 WHERE policy_id = ? AND utc_day = ? AND allowed = 1""",
