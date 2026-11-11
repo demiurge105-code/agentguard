@@ -614,7 +614,7 @@ async def submit_gateway(
 
 
 @pytest.mark.anyio
-async def test_gateway_endpoint_executes_allowed_action_once(app, admin_token, monkeypatch):
+async def test_gateway_endpoint_queues_allowed_action_without_inline_execution(app, admin_token, monkeypatch):
     calls = []
 
     class CountingExecutor:
@@ -631,11 +631,12 @@ async def test_gateway_endpoint_executes_allowed_action_once(app, admin_token, m
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "SUCCEEDED"
+    assert body["status"] == "APPROVED"
+    assert body["execution_status"] == "QUEUED"
     assert body["allowed"] is True
     assert body["operation_id"]
-    assert len(calls) == 1
-    assert calls[0][0].policy_id == created["policy_id"]
+    assert calls == []
+    assert app.state.store.get_gateway_execution_status(body["operation_id"]) == "QUEUED"
 
 
 @pytest.mark.anyio
@@ -703,7 +704,8 @@ async def test_gateway_endpoint_retry_is_idempotent_and_conflict_returns_409(
     assert first.status_code == retry.status_code == 200
     assert first.json() == retry.json()
     assert conflict.status_code == 409
-    assert len(calls) == 1
+    assert calls == []
+    assert first.json()["execution_status"] == "QUEUED"
 
 
 @pytest.mark.anyio
