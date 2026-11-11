@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 import pytest
+from agentguard.intent import ActionIntent
 from agentguard.policy import DecisionReason, Policy
 from agentguard.storage import IdempotencyConflict, SQLitePolicyStore
 
@@ -667,35 +668,35 @@ def test_worker_migration_backfills_only_legacy_approved_operations(tmp_path):
     )
 
     approved = store.begin_gateway_operation(
-        __import__("agentguard.intent", fromlist=["ActionIntent"]).ActionIntent(
+        ActionIntent(
             policy_id, "10", "Alice"
         ),
         token,
         "legacy-approved",
     )
     executing = store.begin_gateway_operation(
-        __import__("agentguard.intent", fromlist=["ActionIntent"]).ActionIntent(
+        ActionIntent(
             policy_id, "10", "Alice"
         ),
         token,
         "legacy-executing",
     )
     unknown = store.begin_gateway_operation(
-        __import__("agentguard.intent", fromlist=["ActionIntent"]).ActionIntent(
+        ActionIntent(
             policy_id, "10", "Alice"
         ),
         token,
         "legacy-unknown",
     )
     succeeded = store.begin_gateway_operation(
-        __import__("agentguard.intent", fromlist=["ActionIntent"]).ActionIntent(
+        ActionIntent(
             policy_id, "10", "Alice"
         ),
         token,
         "legacy-succeeded",
     )
     denied = store.begin_gateway_operation(
-        __import__("agentguard.intent", fromlist=["ActionIntent"]).ActionIntent(
+        ActionIntent(
             policy_id, "200", "Alice"
         ),
         token,
