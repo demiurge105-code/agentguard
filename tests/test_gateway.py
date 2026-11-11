@@ -72,6 +72,7 @@ def test_exact_retry_returns_stored_result_without_second_execution(tmp_path):
     [
         "amount",
         "recipient",
+        "chain",
     ],
 )
 def test_same_key_with_different_intent_conflicts(tmp_path, different_intent):
@@ -85,8 +86,15 @@ def test_same_key_with_different_intent_conflicts(tmp_path, different_intent):
 
     if different_intent == "amount":
         changed = make_intent(policy_id, amount="11")
-    else:
+    elif different_intent == "recipient":
         changed = make_intent(policy_id, recipient="Bob")
+    else:
+        changed = ActionIntent(
+            policy_id,
+            "10",
+            "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01",
+            chain_id="eip155:1",
+        )
 
     with pytest.raises(IdempotencyConflict):
         gateway.submit(changed, token, "conflicting-key")
