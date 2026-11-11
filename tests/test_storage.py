@@ -695,21 +695,30 @@ def test_worker_migration_backfills_only_legacy_approved_operations(tmp_path):
         token,
         "legacy-succeeded",
     )
+    failed = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"),
+        token,
+        "legacy-failed",
+    )
     denied = store.begin_gateway_operation(
-        ActionIntent(
-            policy_id, "200", "Alice"
-        ),
+        ActionIntent(policy_id, "200", "Alice"),
         token,
         "legacy-denied",
     )
-    assert all(item is not None for item in (approved, executing, unknown, succeeded, denied))
+    disallowed_approved = store.begin_gateway_operation(
+        ActionIntent(policy_id, "200", "Alice"),
+        token,
+        "legacy-disallowed-approved",
+    )
+    assert all(item is not None for item in (
+        approved, executing, unknown, succeeded, failed, denied, disallowed_approved
+    ))
 
-    # Recreate the pre-outbox database shape: existing operations, but no job
-    # table and no audit rows describing their earlier transitions.
+    # Recreate the pre-outbox database shape: operations and their existing
+    # audit history remain, but the durable worker outbox table does not.
     connection = sqlite3.connect(path)
     try:
         connection.execute("DROP TABLE gateway_execution_jobs")
-        connection.execute("DELETE FROM gateway_operation_events")
         connection.execute(
             "UPDATE gateway_operations SET status = 'EXECUTING' WHERE operation_id = ?",
             (executing["operation_id"],),
@@ -722,6 +731,14 @@ def test_worker_migration_backfills_only_legacy_approved_operations(tmp_path):
             "UPDATE gateway_operations SET status = 'SUCCEEDED' WHERE operation_id = ?",
             (succeeded["operation_id"],),
         )
+        connection.execute(
+            "UPDATE gateway_operations SET status = 'FAILED' WHERE operation_id = ?",
+            (failed["operation_id"],),
+        )
+        connection.execute(
+            "UPDATE gateway_operations SET status = 'APPROVED', allowed = 0 WHERE operation_id = ?",
+            (disallowed_approved["operation_id"],),
+        )
         connection.commit()
     finally:
         connection.close()
@@ -732,7 +749,16 @@ def test_worker_migration_backfills_only_legacy_approved_operations(tmp_path):
     assert migrated.get_gateway_execution_status(executing["operation_id"]) is None
     assert migrated.get_gateway_execution_status(unknown["operation_id"]) is None
     assert migrated.get_gateway_execution_status(succeeded["operation_id"]) is None
+    assert migrated.get_gateway_execution_status(failed["operation_id"]) is None
     assert migrated.get_gateway_execution_status(denied["operation_id"]) is None
+    assert migrated.get_gateway_execution_status(disallowed_approved["operation_id"]) is None
+
+    replay = migrated.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "legacy-approved"
+    )
+    assert replay is not None
+    assert replay["operation_id"] == approved["operation_id"]
+    assert replay["execution_status"] == "QUEUED"
 
     connection = sqlite3.connect(path)
     try:
@@ -744,7 +770,7 @@ def test_worker_migration_backfills_only_legacy_approved_operations(tmp_path):
             (approved["operation_id"],),
         ).fetchall()
         assert events == [
-            ("LEGACY_IMPORT", None, "APPROVED"),
+            ("OPERATION_CREATED", None, "APPROVED"),
             ("EXECUTION_JOB_BACKFILL", "APPROVED", "APPROVED"),
         ]
     finally:
