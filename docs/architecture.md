@@ -166,14 +166,14 @@ For EVM-bound policies, the recipient must be a valid 20-byte hexadecimal EVM ad
 
 The Gateway endpoint accepts an agent bearer token, a required `Idempotency-Key` header, and a body containing only `policy_id`, `amount` (decimal string), and `recipient`.
 
-The API first performs an authenticated policy-context lookup to obtain the stored `chain_id`. This lookup is not the execution authorization: the gateway reauthenticates atomically when creating/reserving the operation and again when claiming `APPROVED -> EXECUTING`. A token revoked between those stages cannot reach the executor.
+The API first performs an authenticated policy-context lookup to obtain the stored `chain_id`. This lookup is not the execution authorization: the store reauthenticates atomically while creating the operation, reserving budget, and inserting the execution job. A token revoked before this transaction cannot enqueue an operation.
 
-The caller cannot provide chain context, policy limits, daily-spent values, executor configuration, or other extra fields. The route constructs ActionIntent with the chain ID loaded from policy storage and delegates to TrustedExecutionGateway with the server-owned PrintOnlyExecutor.
+The caller cannot provide chain context, policy limits, daily-spent values, executor configuration, or other extra fields. The route constructs ActionIntent with the chain ID loaded from policy storage and calls the store's atomic enqueue method. It does not invoke `TrustedExecutionGateway` or an executor.
 ActionIntent currently requires canonical UUID policy IDs. Newly created policies satisfy this; older migrated policies with non-UUID identifiers can continue using `/check-transaction` but are not accepted by the gateway endpoint.
 
-Responses include the operation ID, status, allow/deny decision, reason code, and timestamps. Invalid credentials return HTTP 401 without disclosing policy existence; conflicting idempotency reuse returns HTTP 409; invalid input returns HTTP 422; storage errors return HTTP 503. A denial is a normal operation response with status DENIED, not an HTTP error.
+Responses include the operation ID, operation status, execution-job status, allow/deny decision, reason code, and timestamps. An approved action initially returns `APPROVED` with `execution_status: QUEUED`; a denial returns `DENIED` with `NOT_QUEUED`. Invalid credentials return HTTP 401 without disclosing policy existence; conflicting idempotency reuse returns HTTP 409; invalid input returns HTTP 422; storage errors return HTTP 503.
 
-The route is simulation-only. SUCCEEDED means the print-only executor returned; it is not evidence of a blockchain transaction or real-world side effect. The legacy `/check-transaction` endpoint remains a separate evaluation/reservation path.
+The route is simulation-only. The separate `agentguard-worker` process invokes the print-only executor. `SUCCEEDED` means that simulation executor returned; it is not evidence of a blockchain transaction or real-world side effect. The legacy `/check-transaction` endpoint remains a separate evaluation/reservation path.
 
 ## Security scope and limitations
 
