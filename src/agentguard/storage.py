@@ -455,8 +455,8 @@ class SQLitePolicyStore:
         try:
             row = connection.execute(
                 """SELECT * FROM gateway_operations
-                WHERE idempotency_key = ?""",
-                (idempotency_key,),
+                WHERE policy_id = ? AND idempotency_key = ?""",
+                (policy_id, idempotency_key),
             ).fetchone()
         finally:
             connection.close()
