@@ -200,6 +200,38 @@ class SQLitePolicyStore:
             connection.close()
         return None if row is None else self._policy(row)
 
+    def get_policy_authenticated(
+        self,
+        policy_id: str,
+        token: str,
+    ) -> Policy | None:
+        """Return policy context only for a currently valid agent token.
+
+        This read is used to obtain the stored chain_id before constructing an
+        ActionIntent. It is not an execution authorization: the gateway
+        reauthenticates inside its atomic reservation transaction and again
+        when claiming execution.
+        """
+        if not isinstance(token, str) or not token or token.strip() != token:
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT max_transaction, daily_limit, allowed_recipients,
+                          chain_id, agent_token_hash
+                FROM policies WHERE policy_id = ?""",
+                (policy_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if row is None or not row["agent_token_hash"]:
+            return None
+        supplied_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(row["agent_token_hash"], supplied_hash):
+            return None
+        return self._policy(row)
+
     def evaluate_and_reserve(
         self,
         policy_id: str,
