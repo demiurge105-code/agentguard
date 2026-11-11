@@ -548,3 +548,106 @@ def test_old_reservation_schema_migrates_conservatively(tmp_path):
     finally:
         connection.close()
     assert states == {"gateway:pending-op": "RESERVED", "legacy-check": "SETTLED"}
+
+
+def _create_executing_gateway_operation(store, token, key):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    policy_id = store.create_policy(
+        Policy("100", "100", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, key
+    )
+    assert operation["status"] == "APPROVED"
+    assert store.claim_gateway_operation(operation["operation_id"], token) is True
+    return operation["operation_id"]
+
+
+def test_stale_recovery_marks_only_old_executing_operations_unknown(tmp_path):
+    from datetime import timedelta
+    store = SQLitePolicyStore(tmp_path / "stale-recovery.db")
+    now = datetime(2026, 11, 11, 18, 0, tzinfo=timezone.utc)
+    stale_id = _create_executing_gateway_operation(store, "stale-token", "stale-old")
+    recent_id = _create_executing_gateway_operation(store, "recent-token", "stale-recent")
+    connection = store._connect()
+    try:
+        connection.execute("UPDATE gateway_operations SET updated_at = ? WHERE operation_id = ?", ((now - timedelta(minutes=10)).isoformat(), stale_id))
+        connection.execute("UPDATE gateway_operations SET updated_at = ? WHERE operation_id = ?", ((now - timedelta(seconds=30)).isoformat(), recent_id))
+        connection.commit()
+    finally:
+        connection.close()
+    recovered = store.recover_stale_gateway_operations(300, now=now, reason="Process restarted; inspect external outcome.")
+    assert recovered == [stale_id]
+    assert store.get_gateway_operation_by_id(stale_id)["status"] == "UNKNOWN"
+    assert store.get_gateway_operation_by_id(stale_id)["reservation_status"] == "RESERVED"
+    assert store.get_gateway_operation_by_id(recent_id)["status"] == "EXECUTING"
+    events = store.list_gateway_operation_events(stale_id)
+    assert events[-1]["event_type"] == "STALE_OPERATION_RECOVERY"
+
+
+def test_stale_recovery_is_idempotent_and_respects_batch_limit(tmp_path):
+    from datetime import timedelta
+    store = SQLitePolicyStore(tmp_path / "stale-batch.db")
+    now = datetime(2026, 11, 11, 18, 0, tzinfo=timezone.utc)
+    ids = [_create_executing_gateway_operation(store, f"token-{i}", f"stale-{i}") for i in range(3)]
+    connection = store._connect()
+    try:
+        connection.execute("UPDATE gateway_operations SET updated_at = ?", ((now - timedelta(hours=1)).isoformat(),))
+        connection.commit()
+    finally:
+        connection.close()
+    first = store.recover_stale_gateway_operations(300, limit=2, now=now)
+    second = store.recover_stale_gateway_operations(300, limit=2, now=now)
+    assert len(first) == 2 and len(second) == 1
+    assert set(first + second) == set(ids)
+    assert store.recover_stale_gateway_operations(300, limit=2, now=now) == []
+
+
+def test_stale_recovery_audit_failure_rolls_back_status(tmp_path, monkeypatch):
+    from datetime import timedelta
+    store = SQLitePolicyStore(tmp_path / "stale-rollback.db")
+    now = datetime(2026, 11, 11, 18, 0, tzinfo=timezone.utc)
+    operation_id = _create_executing_gateway_operation(store, "rollback-token", "stale-rollback")
+    connection = store._connect()
+    try:
+        connection.execute("UPDATE gateway_operations SET updated_at = ? WHERE operation_id = ?", ((now - timedelta(hours=1)).isoformat(), operation_id))
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(store, "_insert_gateway_event", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("audit write failed")))
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        store.recover_stale_gateway_operations(300, now=now)
+    assert store.get_gateway_operation_by_id(operation_id)["status"] == "EXECUTING"
+
+
+def test_stale_recovery_racing_completion_has_one_terminal_winner(tmp_path):
+    from datetime import timedelta
+    store = SQLitePolicyStore(tmp_path / "stale-race.db")
+    now = datetime(2026, 11, 11, 18, 0, tzinfo=timezone.utc)
+    operation_id = _create_executing_gateway_operation(store, "race-recovery-token", "stale-race")
+    connection = store._connect()
+    try:
+        connection.execute("UPDATE gateway_operations SET updated_at = ? WHERE operation_id = ?", ((now - timedelta(hours=1)).isoformat(), operation_id))
+        connection.commit()
+    finally:
+        connection.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        recovery = pool.submit(store.recover_stale_gateway_operations, 300, now=now)
+        completion = pool.submit(store.complete_gateway_operation, operation_id, "SUCCEEDED")
+        recovered_ids = recovery.result()
+        completed = completion.result()
+    operation = store.get_gateway_operation_by_id(operation_id)
+    assert (operation["status"] == "UNKNOWN" and recovered_ids == [operation_id] and not completed) or (operation["status"] == "SUCCEEDED" and recovered_ids == [] and completed)
+    assert operation["reservation_status"] == ("RESERVED" if operation["status"] == "UNKNOWN" else "SETTLED")
+
+
+def test_stale_recovery_validates_bounds_and_timezone(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "stale-validation.db")
+    with pytest.raises(ValueError, match="stale_after_seconds"):
+        store.recover_stale_gateway_operations(30)
+    with pytest.raises(ValueError, match="limit"):
+        store.recover_stale_gateway_operations(300, limit=101)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.recover_stale_gateway_operations(300, now=datetime(2026, 11, 11))
