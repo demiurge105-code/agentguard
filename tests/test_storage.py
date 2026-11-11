@@ -319,3 +319,19 @@ def test_daily_reservation_aggregation_does_not_round_away_prior_spending(tmp_pa
     assert second.allowed is True
     assert third.allowed is False
     assert third.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
+
+
+
+def test_exact_aggregate_at_daily_limit_is_denied_without_validation_error(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "aggregate-coefficient-boundary.db")
+    policy_id = store.create_policy(Policy("1", "1", ["Alice"]))
+
+    almost_one = "0." + "9" * 128
+    first = store.evaluate_and_reserve(policy_id, almost_one, "Alice", "almost-one")
+    second = store.evaluate_and_reserve(policy_id, "1E-128", "Alice", "complete-one")
+    third = store.evaluate_and_reserve(policy_id, "1E-128", "Alice", "over-limit")
+
+    assert first.allowed is True
+    assert second.allowed is True
+    assert third.allowed is False
+    assert third.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
