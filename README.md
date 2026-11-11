@@ -268,7 +268,21 @@ Content-Type: application/json
 }
 ```
 
-The reason and owner actor are recorded atomically with the state change. Reconciliation does not prove whether an external side effect occurred and never permits automatic retry. The API intentionally does not allow manual claims of `SUCCEEDED` or `FAILED`. A trusted executor may return a typed `ExecutionOutcome`; it may report `FAILED` only when its own contract establishes that no side effect occurred. Exceptions and unsupported results remain `UNKNOWN`. Existing operation rows receive an explicit `LEGACY_IMPORT` event; their earlier history cannot be reconstructed.
+The reason and owner actor are recorded atomically with the state change. Reconciliation does not prove whether an external side effect occurred and never permits automatic retry. The API intentionally does not allow manual claims of `SUCCEEDED` or `FAILED`. An owner can also recover a bounded batch of stale `EXECUTING` operations using `POST /gateway/operations/recover-stale`; the caller supplies a minimum age threshold (60 seconds to 7 days), a batch limit (1-100), and an audit reason. This endpoint only moves stale operations to `UNKNOWN`; it never retries execution or releases reservations. Recovery is explicit and is not run automatically at application startup. A trusted executor may return a typed `ExecutionOutcome`; it may report `FAILED` only when its own contract establishes that no side effect occurred. Exceptions and unsupported results remain `UNKNOWN`. Existing operation rows receive an explicit `LEGACY_IMPORT` event; their earlier history cannot be reconstructed.
+
+```http
+POST /gateway/operations/recover-stale
+Authorization: Bearer <your-admin-token>
+Content-Type: application/json
+
+{
+  "stale_after_seconds": 300,
+  "limit": 100,
+  "reason": "Process restarted; inspect unresolved execution outcomes."
+}
+```
+
+Operations are selected by their last update time and recovered in a single SQLite write transaction. A completion racing recovery is serialized: whichever transition commits first wins. A late executor result cannot overwrite an operation already marked `UNKNOWN`.
 
 The existing `/check-transaction` endpoint remains available for policy evaluation and budget reservation without execution.
 

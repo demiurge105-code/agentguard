@@ -6,7 +6,7 @@ import hmac
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
 
@@ -756,6 +756,69 @@ class SQLitePolicyStore:
                 )
             connection.commit()
             return cursor.rowcount == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def recover_stale_gateway_operations(
+        self,
+        stale_after_seconds: int,
+        *,
+        limit: int = 100,
+        now: datetime | None = None,
+        actor_id: str = "owner-recovery",
+        reason: str = "Operation exceeded the stale execution threshold; outcome remains unknown.",
+    ) -> list[str]:
+        """Atomically move stale EXECUTING operations to UNKNOWN.
+
+        This is detection/reconciliation only: it never invokes an executor or
+        releases a reservation. A normal completion racing this method wins
+        only if its transaction commits first.
+        """
+        if type(stale_after_seconds) is not int or not 60 <= stale_after_seconds <= 604800:
+            raise ValueError("stale_after_seconds must be an integer between 60 and 604800.")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100.")
+        if not isinstance(actor_id, str) or not actor_id.strip() or len(actor_id) > 100:
+            raise ValueError("Audit actor_id must contain 1-100 non-whitespace characters.")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise ValueError("Recovery reason must contain 1-500 non-whitespace characters.")
+        reference_time = now or datetime.now(timezone.utc)
+        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+            raise ValueError("now must be timezone-aware.")
+        cutoff = (reference_time.astimezone(timezone.utc) - timedelta(seconds=stale_after_seconds)).isoformat()
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT operation_id FROM gateway_operations
+                WHERE status = 'EXECUTING' AND updated_at <= ?
+                ORDER BY updated_at, operation_id LIMIT ?""",
+                (cutoff, limit),
+            ).fetchall()
+            recovered: list[str] = []
+            timestamp = datetime.now(timezone.utc).isoformat()
+            for row in rows:
+                operation_id = row["operation_id"]
+                cursor = connection.execute(
+                    """UPDATE gateway_operations
+                    SET status = 'UNKNOWN', result = ?, updated_at = ?
+                    WHERE operation_id = ? AND status = 'EXECUTING' AND updated_at <= ?""",
+                    ("Stale execution recovered; outcome remains unknown.", timestamp, operation_id, cutoff),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                self._insert_gateway_event(
+                    connection, operation_id, "EXECUTING", "UNKNOWN",
+                    "STALE_OPERATION_RECOVERY", "owner", actor_id, reason.strip(), timestamp,
+                )
+                recovered.append(operation_id)
+            connection.commit()
+            return recovered
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
