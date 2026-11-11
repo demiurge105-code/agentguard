@@ -135,9 +135,10 @@ def run_demo(
         label = "ALLOW" if result.allowed is True else "DENY"
         print(f"  AgentGuard: {label} ({result.status.value})")
         print(f"  Reason: {result.reason}")
+        print(f"  Operation ID: {result.operation_id}")
 
         if result.status is OperationStatus.SUCCEEDED:
-            print(f"  Operation: {result.operation_id}")
+            print("  Gateway: simulated execution completed.")
         elif result.status is OperationStatus.DENIED:
             print("  Gateway: executor was not called.")
         else:
