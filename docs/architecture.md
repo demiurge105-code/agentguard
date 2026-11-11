@@ -67,13 +67,13 @@ Public methods:
 - `evaluate_and_reserve(policy_id, amount, recipient, request_id) -> Decision | None`
 - `begin_gateway_operation(intent, agent_token, idempotency_key) -> operation | None`
 - `claim_gateway_operation(operation_id, agent_token) -> bool | None`
-- `complete_gateway_operation(operation_id, status, result=None) -> bool`
+- `complete_gateway_operation(operation_id, status, result=None, no_side_effect_confirmed=False) -> bool`
 - `get_gateway_operation(policy_id, idempotency_key) -> operation | None`
 - `get_gateway_operation_by_id(operation_id) -> operation | None`
 - `list_gateway_operation_events(operation_id) -> events | None`
 - `reconcile_gateway_operation_unknown(operation_id, actor_id, reason) -> bool`
 
-Policy limits and transaction amounts are stored as decimal strings. Recipient allowlists are stored as JSON. The nullable `policies.chain_id` column binds a policy to its chain; older databases are migrated with `chain_id = NULL` and therefore remain in legacy mode. The `policies.agent_token_hash` column stores only a SHA-256 hexadecimal digest; raw agent tokens are never written to SQLite. The `daily_reservations` table records each request's UTC date, amount, recipient, and decision.
+Policy limits and transaction amounts are stored as decimal strings. Recipient allowlists are stored as JSON. The nullable `policies.chain_id` column binds a policy to its chain; older databases are migrated with `chain_id = NULL` and therefore remain in legacy mode. The `policies.agent_token_hash` column stores only a SHA-256 hexadecimal digest; raw agent tokens are never written to SQLite. The `daily_reservations` table records each request's UTC date, amount, recipient, decision, and reservation lifecycle state (`RESERVED`, `SETTLED`, `RELEASED`, or `NOT_RESERVED`).
 
 ### Trusted Execution Gateway
 
@@ -87,9 +87,9 @@ The current `PrintOnlyExecutor` only prints a simulated action. Arbitrary execut
 
 Every operation creation and subsequent status transition is accompanied by an append-only `gateway_operation_events` row in the same SQLite transaction. Events include transition, actor type/identifier, bounded reason, and timestamp, but never credentials or arbitrary executor data. Existing operations are migrated with a `LEGACY_IMPORT` event that explicitly states earlier transitions are unavailable.
 
-The owner-authenticated API can inspect an operation and its events. An owner can reconcile only `EXECUTING -> UNKNOWN`, with a required reason. There is deliberately no manual API transition to `SUCCEEDED` or `FAILED`: without an executor-specific verification contract, an operator assertion is not independent evidence. Reconciliation never authorizes another execution attempt. The event log is append-only through the application API, but it is not tamper-proof against a database or host administrator.
+The owner-authenticated API can inspect an operation, its reservation state, and its events. An owner can reconcile only `EXECUTING -> UNKNOWN`, with a required reason. There is deliberately no manual API transition to `SUCCEEDED` or `FAILED`. A trusted executor may return a typed `ExecutionOutcome`; `FAILED` is accepted only when that executor's contract confirms no side effect occurred. Exceptions, unsupported outputs, and ambiguous outcomes remain `UNKNOWN`, so their reservations are not released. Reconciliation never authorizes another execution attempt. The event log is append-only through the application API, but it is not tamper-proof against a database or host administrator.
 
-The gateway is not a sandbox and does not protect against malicious same-process Python code. The demo is wired through the gateway, but the legacy HTTP `/check-transaction` endpoint is not. The authenticated gateway HTTP endpoint, wallet, signer, RPC, broadcasting, reservation settlement, and real-fund execution remain distinct concerns.
+The gateway is not a sandbox and does not protect against malicious same-process Python code. The demo is wired through the gateway, but the legacy HTTP `/check-transaction` endpoint is not. The authenticated gateway HTTP endpoint, wallet, signer, RPC, broadcasting, and real-fund execution remain distinct concerns.
 
 ### Agent token lifecycle
 
@@ -115,7 +115,7 @@ The primary key `(policy_id, request_id)` provides idempotency:
 - Same key with a different amount or recipient: HTTP 409 conflict.
 - The same key remains bound to its original decision even across a UTC day boundary.
 
-An allowed decision is a **budget reservation for a simulated request**, not evidence that funds were actually spent or that a blockchain transaction was broadcast. Settlement and reservation release are not implemented.
+An allowed legacy `/check-transaction` decision remains a committed daily-budget reservation for backward compatibility. Gateway operations create a `RESERVED` row. On `SUCCEEDED`, the operation and reservation atomically transition to `SETTLED`; on a typed trusted-executor `FAILED` outcome, they atomically transition to `RELEASED` only when the executor confirms no side effect occurred. `UNKNOWN` and manual reconciliation to `UNKNOWN` keep the reservation active. Reservation state changes are recorded in the operation audit log in the same SQLite transaction. The reservation day remains the UTC day on which it was created, even if execution completes after midnight. These states describe budget accounting, not blockchain settlement or proof that funds moved.
 
 ### API
 
@@ -168,7 +168,6 @@ AgentGuard is not a wallet security system. It does not hold keys, sign transact
 
 ## What we are NOT building yet
 
-- Reservation settlement or release
 - Policy update or deletion endpoints
 - Wallet connections, private keys, signing, broadcasting, or mainnet transactions
 - User accounts, OAuth, JWT, or a full permissions system
