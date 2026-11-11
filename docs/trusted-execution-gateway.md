@@ -64,8 +64,8 @@ An exact retry returns the stored operation. It does not call the executor again
 
 - `PrintOnlyExecutor` only prints a simulated action; no transaction is sent.
 - The gateway is an in-process service, not an OS security boundary. Malicious Python code with the same process privileges can still import modules or use independent capabilities.
-- The existing `/check-transaction` API and `examples/demo_agent.py` are not yet integrated with this gateway. They retain their existing behavior, so the demo agent can still choose its own print-only execution path.
-- There is no gateway HTTP endpoint, reservation release/settlement, automated crash recovery, or exactly-once guarantee for external side effects.
+- The new `/gateway/operations` endpoint routes authenticated agent requests through this gateway using a server-owned PrintOnlyExecutor. The existing `/check-transaction` API remains separate and does not execute actions.
+- There is no reservation release/settlement, automated crash recovery, or exactly-once guarantee for external side effects.
 - If the process crashes after claiming `EXECUTING`, the operation may remain unresolved until manually reconciled. This is deliberately fail-closed and can reduce availability.
 - Operation records are not tamper-proof audit logs. The SQLite database remains part of the trusted computing base.
 

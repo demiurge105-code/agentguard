@@ -5,14 +5,17 @@ import hashlib
 import hmac
 import os
 import secrets
+import sqlite3
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentguard.chains import normalize_chain_id, normalize_recipient
+from agentguard.gateway import GatewayAuthenticationError, PrintOnlyExecutor, TrustedExecutionGateway
+from agentguard.intent import ActionIntent
 from agentguard.policy import Policy
 from agentguard.storage import IdempotencyConflict, SQLitePolicyStore
 
@@ -93,6 +96,16 @@ class TransactionInput(BaseModel):
         if not value.strip():
             raise ValueError("request_id must not be empty or whitespace.")
         return value
+
+
+class GatewayOperationInput(BaseModel):
+    """Keep raw field types until after agent authentication."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy_id: str = Field(min_length=1)
+    amount: object = Field(json_schema_extra={"type": "string"})
+    recipient: object = Field(json_schema_extra={"type": "string"})
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -219,6 +232,82 @@ def create_app(
             # Do not reveal whether the policy ID exists or the token is invalid.
             raise HTTPException(status_code=401, detail="Invalid or missing agent token.")
         return decision.to_dict()
+
+    @application.post("/gateway/operations")
+    def submit_gateway_operation(
+        data: GatewayOperationInput,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, object]:
+        agent_token = _bearer_token(credentials)
+        if agent_token is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing agent token.",
+            )
+
+        try:
+            # This authenticated lookup supplies the policy's immutable chain
+            # context. The gateway reauthenticates during reservation and claim,
+            # so token rotation between these steps still fails closed.
+            policy = get_store().get_policy_authenticated(data.policy_id, agent_token)
+            if policy is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or missing agent token.",
+                )
+            if idempotency_key is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="The Idempotency-Key header is required.",
+                )
+            if not isinstance(data.amount, str):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Transaction amount must be provided as a decimal string.",
+                )
+            if not isinstance(data.recipient, str):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Recipient must be provided as a string.",
+                )
+
+            intent = ActionIntent(
+                data.policy_id,
+                data.amount,
+                data.recipient,
+                chain_id=policy.chain_id,
+            )
+            result = TrustedExecutionGateway(
+                get_store(),
+                PrintOnlyExecutor(),
+            ).submit(intent, agent_token, idempotency_key)
+        except GatewayAuthenticationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing agent token.",
+            ) from error
+        except IdempotencyConflict as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
+        except sqlite3.Error as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Gateway storage is temporarily unavailable.",
+            ) from error
+
+        return {
+            "operation_id": result.operation_id,
+            "policy_id": result.policy_id,
+            "status": result.status.value,
+            "allowed": result.allowed,
+            "reason_code": result.reason_code,
+            "reason": result.reason,
+            "result": result.result,
+            "created_at": result.created_at,
+            "updated_at": result.updated_at,
+        }
 
     return application
 

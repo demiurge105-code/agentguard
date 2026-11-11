@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import sqlite3
 from datetime import datetime, timezone
@@ -521,6 +522,7 @@ def test_bearer_authentication_is_declared_in_openapi(app):
         "/policies",
         "/policies/{policy_id}/rotate-agent-token",
         "/check-transaction",
+        "/gateway/operations",
     ):
         assert {"HTTPBearer": []} in schema["paths"][path]["post"]["security"]
 
@@ -579,3 +581,377 @@ async def test_transaction_api_rejects_json_numeric_amount_without_reserving(
     assert accepted.status_code == 200
     assert accepted.json()["allowed"] is True
 
+
+
+def gateway_headers(token, idempotency_key):
+    headers = {"Idempotency-Key": idempotency_key}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def submit_gateway(
+    client,
+    policy_id,
+    idempotency_key,
+    token,
+    amount="10",
+    recipient="Alice",
+    extra=None,
+):
+    payload = {
+        "policy_id": policy_id,
+        "amount": amount,
+        "recipient": recipient,
+    }
+    if extra:
+        payload.update(extra)
+    return await client.post(
+        "/gateway/operations",
+        json=payload,
+        headers=gateway_headers(token, idempotency_key),
+    )
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_executes_allowed_action_once(app, admin_token, monkeypatch):
+    calls = []
+
+    class CountingExecutor:
+        def __call__(self, intent, operation_id):
+            calls.append((intent, operation_id))
+            return None
+
+    monkeypatch.setattr(api_module, "PrintOnlyExecutor", CountingExecutor)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        response = await submit_gateway(
+            client, created["policy_id"], "gateway-allowed", created["agent_token"]
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "SUCCEEDED"
+    assert body["allowed"] is True
+    assert body["operation_id"]
+    assert len(calls) == 1
+    assert calls[0][0].policy_id == created["policy_id"]
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_denial_never_calls_executor(app, admin_token, monkeypatch):
+    calls = []
+
+    class CountingExecutor:
+        def __call__(self, intent, operation_id):
+            calls.append(operation_id)
+
+    monkeypatch.setattr(api_module, "PrintOnlyExecutor", CountingExecutor)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (
+            await create_policy(
+                client,
+                admin_token,
+                {
+                    "max_transaction": "5",
+                    "daily_limit": "100",
+                    "allowed_recipients": ["Alice"],
+                },
+            )
+        ).json()
+        response = await submit_gateway(
+            client,
+            created["policy_id"],
+            "gateway-denied",
+            created["agent_token"],
+            amount="10",
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "DENIED"
+    assert response.json()["allowed"] is False
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_retry_is_idempotent_and_conflict_returns_409(
+    app, admin_token, monkeypatch
+):
+    calls = []
+
+    class CountingExecutor:
+        def __call__(self, intent, operation_id):
+            calls.append(operation_id)
+
+    monkeypatch.setattr(api_module, "PrintOnlyExecutor", CountingExecutor)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        first = await submit_gateway(
+            client, created["policy_id"], "gateway-retry", created["agent_token"]
+        )
+        retry = await submit_gateway(
+            client, created["policy_id"], "gateway-retry", created["agent_token"]
+        )
+        conflict = await submit_gateway(
+            client,
+            created["policy_id"],
+            "gateway-retry",
+            created["agent_token"],
+            amount="11",
+        )
+
+    assert first.status_code == retry.status_code == 200
+    assert first.json() == retry.json()
+    assert conflict.status_code == 409
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_rejects_missing_invalid_and_cross_policy_tokens(
+    app, admin_token
+):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first = (await create_policy(client, admin_token)).json()
+        second = (await create_policy(client, admin_token)).json()
+        missing = await submit_gateway(
+            client, first["policy_id"], "missing-token", None
+        )
+        invalid = await submit_gateway(
+            client, first["policy_id"], "invalid-token", "wrong-token"
+        )
+        cross_policy = await submit_gateway(
+            client, second["policy_id"], "cross-policy", first["agent_token"]
+        )
+        unknown = await submit_gateway(
+            client, "unknown-policy", "unknown-policy", "wrong-token"
+        )
+
+    assert [missing.status_code, invalid.status_code, cross_policy.status_code, unknown.status_code] == [
+        401, 401, 401, 401
+    ]
+    assert missing.json() == invalid.json() == cross_policy.json() == unknown.json()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("amount", [0.1, 1, True, "NaN", "Infinity", "-1", "not-a-number"])
+async def test_gateway_endpoint_rejects_invalid_money_without_reserving(
+    app, admin_token, amount
+):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        response = await submit_gateway(
+            client,
+            created["policy_id"],
+            "invalid-gateway-amount",
+            created["agent_token"],
+            amount=amount,
+        )
+
+    assert response.status_code == 422
+    connection = app.state.store._connect()
+    try:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM gateway_operations"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert count == 0
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_authenticates_before_money_validation(app, admin_token):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        response = await submit_gateway(
+            client,
+            created["policy_id"],
+            "invalid-token-numeric-amount",
+            "wrong-token",
+            amount=1,
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_requires_idempotency_key(app, admin_token):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        response = await client.post(
+            "/gateway/operations",
+            json={
+                "policy_id": created["policy_id"],
+                "amount": "10",
+                "recipient": "Alice",
+            },
+            headers={"Authorization": f"Bearer {created['agent_token']}"},
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"chain_id": "eip155:1"},
+        {"daily_spent": "0"},
+        {"daily_limit": "1000"},
+        {"max_transaction": "1000"},
+        {"executor": "arbitrary"},
+    ],
+)
+async def test_gateway_endpoint_rejects_caller_overrides(app, admin_token, extra):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        response = await submit_gateway(
+            client,
+            created["policy_id"],
+            "forbidden-field-" + next(iter(extra)),
+            created["agent_token"],
+            extra=extra,
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_uses_stored_evm_chain_context(app, admin_token):
+    address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created_response = await create_policy(
+            client,
+            admin_token,
+            {
+                "max_transaction": "100",
+                "daily_limit": "500",
+                "allowed_recipients": [address],
+                "chain_id": "eip155:8453",
+            },
+        )
+        created = created_response.json()
+        valid = await submit_gateway(
+            client,
+            created["policy_id"],
+            "evm-valid",
+            created["agent_token"],
+            recipient=address.lower(),
+        )
+        invalid = await submit_gateway(
+            client,
+            created["policy_id"],
+            "evm-invalid",
+            created["agent_token"],
+            recipient="not-an-address",
+        )
+
+    assert valid.status_code == 200
+    assert valid.json()["status"] == "SUCCEEDED"
+    assert invalid.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_revalidates_token_at_execution_claim(
+    app, admin_token, monkeypatch
+):
+    calls = []
+    new_token = "rotated-before-claim"
+
+    class CountingExecutor:
+        def __call__(self, intent, operation_id):
+            calls.append(operation_id)
+
+    monkeypatch.setattr(api_module, "PrintOnlyExecutor", CountingExecutor)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        store = app.state.store
+        original_claim = store.claim_gateway_operation
+
+        def rotate_then_claim(operation_id, token):
+            store.rotate_agent_token(
+                created["policy_id"],
+                hashlib.sha256(new_token.encode("utf-8")).hexdigest(),
+            )
+            return original_claim(operation_id, token)
+
+        monkeypatch.setattr(store, "claim_gateway_operation", rotate_then_claim)
+        response = await submit_gateway(
+            client,
+            created["policy_id"],
+            "rotate-during-gateway",
+            created["agent_token"],
+        )
+
+    assert response.status_code == 401
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_storage_failure_before_claim_fails_closed(
+    app, admin_token, monkeypatch
+):
+    calls = []
+
+    class CountingExecutor:
+        def __call__(self, intent, operation_id):
+            calls.append(operation_id)
+
+    monkeypatch.setattr(api_module, "PrintOnlyExecutor", CountingExecutor)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+
+        def fail_claim(operation_id, agent_token):
+            raise sqlite3.OperationalError("database unavailable")
+
+        monkeypatch.setattr(app.state.store, "claim_gateway_operation", fail_claim)
+        response = await submit_gateway(
+            client,
+            created["policy_id"],
+            "gateway-storage-failure",
+            created["agent_token"],
+        )
+
+    assert response.status_code == 503
+    assert calls == []
+    operation = app.state.store.get_gateway_operation(
+        created["policy_id"], "gateway-storage-failure"
+    )
+    assert operation["status"] == "APPROVED"
+
+
+@pytest.mark.anyio
+async def test_gateway_endpoint_concurrent_retries_execute_once(app, admin_token, monkeypatch):
+    from threading import Lock
+    import time
+
+    calls = []
+    lock = Lock()
+
+    class SlowExecutor:
+        def __call__(self, intent, operation_id):
+            with lock:
+                calls.append(operation_id)
+            time.sleep(0.05)
+
+    monkeypatch.setattr(api_module, "PrintOnlyExecutor", SlowExecutor)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        responses = await asyncio.gather(
+            *[
+                submit_gateway(
+                    client,
+                    created["policy_id"],
+                    "gateway-concurrent",
+                    created["agent_token"],
+                )
+                for _ in range(8)
+            ]
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert len(calls) == 1
+    assert len({response.json()["operation_id"] for response in responses}) == 1
+    assert app.state.store.get_gateway_operation(
+        created["policy_id"], "gateway-concurrent"
+    )["status"] == "SUCCEEDED"

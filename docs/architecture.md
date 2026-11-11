@@ -15,24 +15,24 @@ The backward-compatible HTTP policy-check flow remains:
 5. The SQLite store serializes evaluation and reservation in a write transaction.
 6. The API returns an `ALLOW` or `DENY` decision with a stable reason code.
 
-## Gateway demo flow
+## Gateway API and demo flow
 
-The canonical `examples/demo_agent.py` now exercises the in-process `TrustedExecutionGateway` rather than calling `/check-transaction` and then invoking its own executor.
+The canonical `examples/demo_agent.py` exercises the authenticated HTTP Gateway endpoint. The agent process does not open SQLite or receive an executor reference.
 
 1. The demo creates a policy through the local API.
-2. It opens the same SQLite database configured by `AGENTGUARD_DB_PATH` and verifies that the policy exists.
-3. Each proposal is converted into the core immutable `ActionIntent`.
-4. The demo submits the intent, agent token, and idempotency key to `TrustedExecutionGateway`. The proposal logic receives the gateway, not the executor reference.
-5. The store authenticates the token, binds the globally unique idempotency key to the policy and canonical intent, evaluates policy, reserves budget, and persists the initial operation in one `BEGIN IMMEDIATE` transaction.
-6. Before execution, the store revalidates the current agent token and atomically claims `APPROVED -> EXECUTING`. Only one concurrent retry can win this transition.
-7. The gateway passes the same immutable `ActionIntent` and stable operation ID to `PrintOnlyExecutor`. The print-only executor sends no transaction.
+2. Each proposal is converted into the core immutable `ActionIntent`.
+3. The demo submits the policy ID, exact decimal amount, recipient, agent token, and a unique `Idempotency-Key` to `POST /gateway/operations`.
+4. The API loads the policy's stored chain context. It does not accept caller-supplied chain IDs, policy limits, daily-spent values, or executor parameters.
+5. The API authenticates the token to obtain policy context, then the gateway reauthenticates atomically when creating/reserving the operation and again when claiming `APPROVED -> EXECUTING`. A token revoked between those stages cannot reach the executor.
+6. The store binds the globally unique idempotency key to the policy and canonical intent, evaluates policy, reserves budget, and persists the operation in one `BEGIN IMMEDIATE` transaction.
+7. Only the request that wins the atomic execution claim may invoke the server-owned `PrintOnlyExecutor`. The executor receives the same immutable `ActionIntent` and stable operation ID.
 8. The gateway persists `SUCCEEDED` or `UNKNOWN`. Executor exceptions and arbitrary executor return data are not stored. An ambiguous operation is never automatically executed again.
 
 The operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. `FAILED` is reserved for a future executor contract that can prove no side effect occurred. If the process crashes after `EXECUTING` is committed, the operation remains unresolved until manually reconciled; retries do not invoke the executor again.
 
 Idempotency keys are globally unique within the SQLite database. Reuse with a different policy or canonical intent conflicts. Gateway reservations use a random operation-scoped reservation ID rather than the caller-provided key, avoiding collisions with legacy `/check-transaction` request IDs.
 
-This is an in-process application boundary, not a Python sandbox. Malicious code with the same process privileges can still import internal modules or use independent execution capabilities. The existing `/check-transaction` endpoint remains separate and is not protected by this gateway yet.
+The gateway is an in-process application boundary on the API server, not a Python sandbox. Malicious code with the same process privileges can still import internal modules or use independent execution capabilities. The legacy `/check-transaction` endpoint remains a separate evaluation/reservation path and does not execute actions.
 
 ## Components
 
@@ -136,9 +136,22 @@ Requires `Authorization: Bearer <agent-token>` associated with the policy ID in 
 
 For EVM-bound policies, the recipient must be a valid 20-byte hexadecimal EVM address. Caller-supplied `daily_spent` and policy overrides are rejected. Missing, invalid, and cross-policy credentials all return HTTP 401 without revealing whether a policy ID exists. Reusing an idempotency key with a different payload returns HTTP 409.
 
+### POST /gateway/operations
+
+The Gateway endpoint accepts an agent bearer token, a required `Idempotency-Key` header, and a body containing only `policy_id`, `amount` (decimal string), and `recipient`.
+
+The API first performs an authenticated policy-context lookup to obtain the stored `chain_id`. This lookup is not the execution authorization: the gateway reauthenticates atomically when creating/reserving the operation and again when claiming `APPROVED -> EXECUTING`. A token revoked between those stages cannot reach the executor.
+
+The caller cannot provide chain context, policy limits, daily-spent values, executor configuration, or other extra fields. The route constructs ActionIntent with the chain ID loaded from policy storage and delegates to TrustedExecutionGateway with the server-owned PrintOnlyExecutor.
+ActionIntent currently requires canonical UUID policy IDs. Newly created policies satisfy this; older migrated policies with non-UUID identifiers can continue using `/check-transaction` but are not accepted by the gateway endpoint.
+
+Responses include the operation ID, status, allow/deny decision, reason code, and timestamps. Invalid credentials return HTTP 401 without disclosing policy existence; conflicting idempotency reuse returns HTTP 409; invalid input returns HTTP 422; storage errors return HTTP 503. A denial is a normal operation response with status DENIED, not an HTTP error.
+
+The route is simulation-only. SUCCEEDED means the print-only executor returned; it is not evidence of a blockchain transaction or real-world side effect. The legacy `/check-transaction` endpoint remains a separate evaluation/reservation path.
+
 ## Security scope and limitations
 
-AgentGuard is not a wallet security system. It does not hold keys, sign transactions, submit transactions, or stop malicious code from bypassing the gateway or API. Agent tokens authenticate access to the policy-evaluation endpoint and in-process gateway; they are not proof of wallet ownership. The legacy /check-transaction endpoint is not yet routed through the gateway. Reservations are not reconciled with actual blockchain settlement. Do not use this system as the sole control protecting real funds.
+AgentGuard is not a wallet security system. It does not hold keys, sign transactions, submit transactions, or stop malicious code from bypassing the gateway or API. Agent tokens authenticate access to the policy-evaluation endpoint and in-process gateway; they are not proof of wallet ownership. The legacy /check-transaction endpoint remains separate from the gateway execution endpoint. Reservations are not reconciled with actual blockchain settlement. Do not use this system as the sole control protecting real funds.
 
 ## Technology
 
