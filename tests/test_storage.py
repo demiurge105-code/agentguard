@@ -302,3 +302,20 @@ def test_storage_rejects_float_and_boolean_amounts_before_reserving(tmp_path, am
         policy_id, "10", "Alice", "invalid-number"
     )
     assert decision.allowed is True
+
+
+
+def test_daily_reservation_aggregation_does_not_round_away_prior_spending(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "exact-daily-total.db")
+    policy_id = store.create_policy(
+        Policy("1E+28", "10000000000000000000000000001", ["Alice"])
+    )
+
+    first = store.evaluate_and_reserve(policy_id, "1E+28", "Alice", "large")
+    second = store.evaluate_and_reserve(policy_id, "1", "Alice", "small-1")
+    third = store.evaluate_and_reserve(policy_id, "1", "Alice", "small-2")
+
+    assert first.allowed is True
+    assert second.allowed is True
+    assert third.allowed is False
+    assert third.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
