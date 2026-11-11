@@ -640,6 +640,36 @@ async def test_gateway_endpoint_queues_allowed_action_without_inline_execution(a
 
 
 @pytest.mark.anyio
+async def test_api_enqueue_then_separate_worker_completes_operation(app, admin_token):
+    from agentguard.worker import ExecutionWorker
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        submitted = await submit_gateway(
+            client, created["policy_id"], "api-worker-integration", created["agent_token"]
+        )
+        operation_id = submitted.json()["operation_id"]
+        assert submitted.json()["status"] == "APPROVED"
+        assert submitted.json()["execution_status"] == "QUEUED"
+
+        worker = ExecutionWorker(
+            app.state.store,
+            lambda intent, operation_id: None,
+            "integration-worker",
+        )
+        assert worker.run_once() == operation_id
+        inspected = await client.get(
+            f"/gateway/operations/{operation_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    assert inspected.status_code == 200
+    assert inspected.json()["status"] == "SUCCEEDED"
+    assert inspected.json()["execution_status"] == "COMPLETED"
+    assert inspected.json()["reservation_status"] == "SETTLED"
+
+
+@pytest.mark.anyio
 async def test_gateway_endpoint_denial_never_calls_executor(app, admin_token, monkeypatch):
     calls = []
 
