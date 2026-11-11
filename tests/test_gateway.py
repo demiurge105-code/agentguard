@@ -329,7 +329,12 @@ def test_executor_receives_the_same_immutable_intent_that_was_canonicalized(tmp_
 
 def test_chain_context_must_match_stored_policy(tmp_path):
     store, policy_id, token = make_store(tmp_path)
-    intent = ActionIntent(policy_id, "1", "Alice", chain_id="eip155:1")
+    intent = ActionIntent(
+        policy_id,
+        "1",
+        "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01",
+        chain_id="eip155:1",
+    )
     gateway = TrustedExecutionGateway(store, lambda action, operation_id: "never")
 
     with pytest.raises(ValueError, match="chain_id"):
