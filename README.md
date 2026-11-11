@@ -123,7 +123,7 @@ If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotatio
 
 ### Run the demo agent
 
-Use `examples/demo_agent.py` as the canonical Gateway v1 demo. It creates a policy through the local FastAPI endpoint, opens the same SQLite database, then submits two immutable `ActionIntent` objects to `TrustedExecutionGateway`.
+Use `examples/demo_agent.py` as the canonical Gateway v1 demo. It creates a policy through the local FastAPI endpoint, builds two immutable `ActionIntent` objects, then submits them over HTTP to `/gateway/operations`.
 
 The demo does **not** call `/check-transaction` and then decide for itself whether to execute. The API server authenticates the agent token, evaluates and reserves budget, persists the operation, atomically claims execution, and invokes its own `PrintOnlyExecutor` only for an approved action. The agent process never opens the SQLite database or receives an executor reference.
 
