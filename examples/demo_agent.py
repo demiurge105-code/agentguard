@@ -7,20 +7,12 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import uuid
-from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from agentguard.gateway import (
-    OperationStatus,
-    PrintOnlyExecutor,
-    TrustedExecutionGateway,
-)
 from agentguard.intent import ActionIntent
-from agentguard.storage import SQLitePolicyStore
 
 
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -54,14 +46,18 @@ def api_request(
     path: str,
     payload: dict[str, object],
     bearer_token: str,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, object]:
+    headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     request = Request(
         f"{base_url}{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {bearer_token}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -81,11 +77,7 @@ def api_request(
     return result
 
 
-def run_demo(
-    base_url: str,
-    admin_token: str,
-    db_path: str | Path = "agentguard.db",
-) -> None:
+def run_demo(base_url: str, admin_token: str) -> None:
     print("Creating a demo policy...")
     policy = api_request(
         base_url,
@@ -99,47 +91,52 @@ def run_demo(
     )
     policy_id = policy.get("policy_id")
     agent_token = policy.get("agent_token")
+    chain_id = policy.get("chain_id")
     if not isinstance(policy_id, str) or not isinstance(agent_token, str):
         raise RuntimeError("Policy creation response is missing its policy ID or agent token.")
+    if chain_id is not None and not isinstance(chain_id, str):
+        raise RuntimeError("Policy creation response contains an invalid chain ID.")
 
-    # The API and this local demo must use the same configured SQLite database.
-    store = SQLitePolicyStore(db_path)
-    if store.get_policy(policy_id) is None:
-        raise RuntimeError(
-            "The created policy was not found in AGENTGUARD_DB_PATH. "
-            "Start the API and demo with the same database path."
-        )
-
-    gateway = TrustedExecutionGateway(store, PrintOnlyExecutor())
     print(f"Policy created: {policy_id}")
     print("Agent token received and kept in memory (not displayed).")
     print()
 
-    # The proposal logic receives the gateway, not an executor reference.
+    # The agent sends an intent to the API; it never receives an executor reference.
     proposals = (
         ("Small transfer to an approved recipient", "25", "0xDemoRecipient"),
         ("Transfer above the per-transaction limit", "75", "0xDemoRecipient"),
     )
 
     for description, amount, recipient in proposals:
-        intent = ActionIntent(policy_id, amount, recipient)
+        intent = ActionIntent(policy_id, amount, recipient, chain_id=chain_id)
         print(f"Agent proposal: {description}")
         print(f"  Amount: {intent.amount}")
         print(f"  Recipient: {intent.recipient}")
 
-        result = gateway.submit(
-            intent,
+        result = api_request(
+            base_url,
+            "/gateway/operations",
+            {
+                "policy_id": intent.policy_id,
+                "amount": format(intent.amount, "f"),
+                "recipient": intent.recipient,
+            },
             agent_token,
-            idempotency_key=f"demo-{uuid.uuid4().hex}",
+            extra_headers={"Idempotency-Key": f"demo-{uuid.uuid4().hex}"},
         )
-        label = "ALLOW" if result.allowed is True else "DENY"
-        print(f"  AgentGuard: {label} ({result.status.value})")
-        print(f"  Reason: {result.reason}")
-        print(f"  Operation ID: {result.operation_id}")
+        allowed = result.get("allowed") is True
+        status_value = result.get("status")
+        if not isinstance(status_value, str):
+            raise RuntimeError("Gateway response is missing its operation status.")
 
-        if result.status is OperationStatus.SUCCEEDED:
+        label = "ALLOW" if allowed else "DENY"
+        print(f"  AgentGuard: {label} ({status_value})")
+        print(f"  Reason: {result.get('reason', 'No reason returned')}")
+        print(f"  Operation ID: {result.get('operation_id', 'Unavailable')}")
+
+        if status_value == "SUCCEEDED":
             print("  Gateway: simulated execution completed.")
-        elif result.status is OperationStatus.DENIED:
+        elif status_value == "DENIED":
             print("  Gateway: executor was not called.")
         else:
             print(
@@ -161,15 +158,13 @@ def main() -> int:
         base_url = local_api_url(
             os.getenv("AGENTGUARD_API_URL", "http://127.0.0.1:8000")
         )
-        db_path = os.getenv("AGENTGUARD_DB_PATH", "agentguard.db")
-        run_demo(base_url, admin_token, db_path)
+        run_demo(base_url, admin_token)
     except (
         ValueError,
         RuntimeError,
         PermissionError,
         URLError,
         OSError,
-        sqlite3.Error,
     ) as error:
         print(f"Demo failed: {error}")
         return 1
