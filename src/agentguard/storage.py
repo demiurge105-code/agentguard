@@ -569,13 +569,22 @@ class SQLitePolicyStore:
         now: datetime | None = None,
     ) -> dict[str, object] | None:
         """Lease one queued job; expired pre-dispatch leases may be reclaimed."""
-        if not isinstance(worker_id, str) or not worker_id.strip() or len(worker_id) > 100:
-            raise ValueError("worker_id must contain 1-100 non-whitespace characters.")
+        if (
+            not isinstance(worker_id, str)
+            or not worker_id
+            or worker_id.strip() != worker_id
+            or len(worker_id) > 100
+        ):
+            raise ValueError("worker_id must contain 1-100 non-whitespace characters without surrounding whitespace.")
         if type(lease_seconds) is not int or not 5 <= lease_seconds <= 300:
             raise ValueError("lease_seconds must be an integer between 5 and 300.")
         reference_time = now or datetime.now(timezone.utc)
-        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
-            raise ValueError("now must be timezone-aware.")
+        if (
+            not isinstance(reference_time, datetime)
+            or reference_time.tzinfo is None
+            or reference_time.utcoffset() is None
+        ):
+            raise ValueError("now must be a timezone-aware datetime.")
         timestamp_dt = reference_time.astimezone(timezone.utc)
         timestamp = timestamp_dt.isoformat()
         lease_expires_at = (timestamp_dt + timedelta(seconds=lease_seconds)).isoformat()
@@ -593,7 +602,9 @@ class SQLitePolicyStore:
                 WHERE operations.status = 'APPROVED'
                   AND (
                     jobs.status = 'QUEUED'
-                    OR (jobs.status = 'LEASED' AND jobs.lease_expires_at <= ?)
+                    OR (jobs.status = 'LEASED'
+                        AND jobs.lease_expires_at IS NOT NULL
+                        AND jobs.lease_expires_at <= ?)
                   )
                 ORDER BY jobs.created_at, jobs.operation_id
                 LIMIT 1""",
