@@ -15,7 +15,6 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from agentguard.gateway import (
-    GatewayAuthenticationError,
     OperationStatus,
     PrintOnlyExecutor,
     TrustedExecutionGateway,
