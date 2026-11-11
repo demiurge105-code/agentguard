@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 import pytest
+from agentguard.intent import ActionIntent
 from agentguard.policy import DecisionReason, Policy
 from agentguard.storage import IdempotencyConflict, SQLitePolicyStore
 
@@ -651,3 +652,142 @@ def test_stale_recovery_validates_bounds_and_timezone(tmp_path):
         store.recover_stale_gateway_operations(300, limit=101)
     with pytest.raises(ValueError, match="timezone-aware"):
         store.recover_stale_gateway_operations(300, now=datetime(2026, 11, 11))
+
+
+
+def test_worker_migration_backfills_only_legacy_approved_operations(tmp_path):
+    import sqlite3
+    import hashlib
+
+    path = tmp_path / "before-worker-outbox.db"
+    store = SQLitePolicyStore(path)
+    token = "legacy-worker-token"
+    policy_id = store.create_policy(
+        Policy("100", "1000", ["Alice"]),
+        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    )
+
+    approved = store.begin_gateway_operation(
+        ActionIntent(
+            policy_id, "10", "Alice"
+        ),
+        token,
+        "legacy-approved",
+    )
+    executing = store.begin_gateway_operation(
+        ActionIntent(
+            policy_id, "10", "Alice"
+        ),
+        token,
+        "legacy-executing",
+    )
+    unknown = store.begin_gateway_operation(
+        ActionIntent(
+            policy_id, "10", "Alice"
+        ),
+        token,
+        "legacy-unknown",
+    )
+    succeeded = store.begin_gateway_operation(
+        ActionIntent(
+            policy_id, "10", "Alice"
+        ),
+        token,
+        "legacy-succeeded",
+    )
+    failed = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"),
+        token,
+        "legacy-failed",
+    )
+    denied = store.begin_gateway_operation(
+        ActionIntent(policy_id, "200", "Alice"),
+        token,
+        "legacy-denied",
+    )
+    disallowed_approved = store.begin_gateway_operation(
+        ActionIntent(policy_id, "200", "Alice"),
+        token,
+        "legacy-disallowed-approved",
+    )
+    assert all(item is not None for item in (
+        approved, executing, unknown, succeeded, failed, denied, disallowed_approved
+    ))
+
+    # Recreate the pre-outbox database shape: operations and their existing
+    # audit history remain, but the durable worker outbox table does not.
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE gateway_execution_jobs")
+        connection.execute(
+            "UPDATE gateway_operations SET status = 'EXECUTING' WHERE operation_id = ?",
+            (executing["operation_id"],),
+        )
+        connection.execute(
+            "UPDATE gateway_operations SET status = 'UNKNOWN' WHERE operation_id = ?",
+            (unknown["operation_id"],),
+        )
+        connection.execute(
+            "UPDATE gateway_operations SET status = 'SUCCEEDED' WHERE operation_id = ?",
+            (succeeded["operation_id"],),
+        )
+        connection.execute(
+            "UPDATE gateway_operations SET status = 'FAILED' WHERE operation_id = ?",
+            (failed["operation_id"],),
+        )
+        connection.execute(
+            "UPDATE gateway_operations SET status = 'APPROVED', allowed = 0 WHERE operation_id = ?",
+            (disallowed_approved["operation_id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SQLitePolicyStore(path)
+
+    assert migrated.get_gateway_execution_status(approved["operation_id"]) == "QUEUED"
+    assert migrated.get_gateway_execution_status(executing["operation_id"]) is None
+    assert migrated.get_gateway_execution_status(unknown["operation_id"]) is None
+    assert migrated.get_gateway_execution_status(succeeded["operation_id"]) is None
+    assert migrated.get_gateway_execution_status(failed["operation_id"]) is None
+    assert migrated.get_gateway_execution_status(denied["operation_id"]) is None
+    assert migrated.get_gateway_execution_status(disallowed_approved["operation_id"]) is None
+
+    replay = migrated.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "legacy-approved"
+    )
+    assert replay is not None
+    assert replay["operation_id"] == approved["operation_id"]
+    assert replay["execution_status"] == "QUEUED"
+
+    connection = sqlite3.connect(path)
+    try:
+        events = connection.execute(
+            """SELECT event_type, previous_status, new_status
+            FROM gateway_operation_events
+            WHERE operation_id = ?
+            ORDER BY event_id""",
+            (approved["operation_id"],),
+        ).fetchall()
+        assert events == [
+            ("OPERATION_CREATED", None, "APPROVED"),
+            ("EXECUTION_JOB_BACKFILL", "APPROVED", "APPROVED"),
+        ]
+    finally:
+        connection.close()
+
+    # Reopening the store must not duplicate the job or migration audit event.
+    SQLitePolicyStore(path)
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM gateway_execution_jobs WHERE operation_id = ?",
+            (approved["operation_id"],),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM gateway_operation_events
+            WHERE operation_id = ? AND event_type = 'EXECUTION_JOB_BACKFILL'""",
+            (approved["operation_id"],),
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()

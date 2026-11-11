@@ -195,6 +195,41 @@ class SQLitePolicyStore:
                         WHERE events.operation_id = operations.operation_id
                     )"""
                 )
+
+                # Older releases persisted APPROVED operations before durable worker
+                # jobs existed. Capture only rows that this migration will enqueue so
+                # their audit events are precise even when they already have history.
+                connection.execute(
+                    """CREATE TEMP TABLE _agentguard_backfilled_jobs AS
+                    SELECT operations.operation_id, operations.updated_at
+                    FROM gateway_operations AS operations
+                    LEFT JOIN gateway_execution_jobs AS jobs
+                      ON jobs.operation_id = operations.operation_id
+                    WHERE operations.status = 'APPROVED'
+                      AND operations.allowed = 1
+                      AND jobs.operation_id IS NULL"""
+                )
+                connection.execute(
+                    """INSERT INTO gateway_execution_jobs (
+                        operation_id, status, fencing_token, worker_id,
+                        lease_expires_at, created_at, updated_at
+                    )
+                    SELECT operation_id, 'QUEUED', 0, NULL, NULL,
+                           updated_at, updated_at
+                    FROM _agentguard_backfilled_jobs"""
+                )
+                connection.execute(
+                    """INSERT INTO gateway_operation_events (
+                        operation_id, previous_status, new_status, event_type,
+                        actor_type, actor_id, reason, created_at
+                    )
+                    SELECT operation_id, 'APPROVED', 'APPROVED',
+                           'EXECUTION_JOB_BACKFILL', 'system', 'schema-migration',
+                           'Queued legacy approved operation during worker outbox migration.',
+                           updated_at
+                    FROM _agentguard_backfilled_jobs"""
+                )
+                connection.execute("DROP TABLE _agentguard_backfilled_jobs")
         finally:
             connection.close()
 
