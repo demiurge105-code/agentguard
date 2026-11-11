@@ -1,5 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal
 import hashlib
 from threading import Lock
 import time
@@ -14,9 +13,6 @@ from agentguard.gateway import (
 from agentguard.intent import ActionIntent
 from agentguard.policy import Policy
 from agentguard.storage import IdempotencyConflict, SQLitePolicyStore
-
-
-POLICY_ID_PLACEHOLDER = "00000000-0000-0000-0000-000000000000"
 
 
 def make_store(tmp_path, *, max_transaction="100", daily_limit="200"):
@@ -93,6 +89,24 @@ def test_same_key_with_different_intent_conflicts(tmp_path, different_intent):
 
     with pytest.raises(IdempotencyConflict):
         gateway.submit(changed, token, "conflicting-key")
+
+    assert len(calls) == 1
+
+
+def test_same_idempotency_key_under_different_policy_conflicts(tmp_path):
+    store, policy_id, token = make_store(tmp_path)
+    calls = []
+    gateway = TrustedExecutionGateway(
+        store, lambda intent, operation_id: calls.append(operation_id) or "ok"
+    )
+    gateway.submit(make_intent(policy_id), token, "global-key")
+
+    second_policy_id = store.create_policy(
+        Policy("100", "200", ["Alice", "Bob"]),
+        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    )
+    with pytest.raises(IdempotencyConflict):
+        gateway.submit(make_intent(second_policy_id), token, "global-key")
 
     assert len(calls) == 1
 
