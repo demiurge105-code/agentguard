@@ -91,9 +91,14 @@ class TrustedExecutionGateway:
                 "Invalid agent token or policy not found."
             )
 
+        if record.get("canonical_intent") != intent.canonical_json:
+            raise RuntimeError("Stored operation intent does not match the submitted ActionIntent.")
+
         operation = _result_from_record(record)
         if operation.status is not OperationStatus.APPROVED:
             return operation
+        if operation.allowed is not True or operation.reason_code != "allowed":
+            raise RuntimeError("Gateway refused an inconsistent or malformed approval record.")
 
         if not self._store.claim_gateway_operation(operation.operation_id):
             current = self._store.get_gateway_operation(
