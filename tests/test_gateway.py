@@ -37,7 +37,7 @@ def test_gateway_executes_approved_intent_and_persists_success(tmp_path):
 
     def executor(intent, operation_id):
         calls.append((intent, operation_id))
-        return "simulated"
+        return None
 
     gateway = TrustedExecutionGateway(store, executor)
     intent = make_intent(policy_id)
@@ -46,7 +46,7 @@ def test_gateway_executes_approved_intent_and_persists_success(tmp_path):
 
     assert result.status is OperationStatus.SUCCEEDED
     assert result.allowed is True
-    assert result.result == "simulated"
+    assert result.result == "Execution completed."
     assert len(calls) == 1
     assert calls[0] == (intent, result.operation_id)
     assert store.get_gateway_operation(policy_id, "operation-1")["status"] == "SUCCEEDED"
@@ -56,7 +56,7 @@ def test_exact_retry_returns_stored_result_without_second_execution(tmp_path):
     store, policy_id, token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or "ok"
+        store, lambda intent, operation_id: calls.append(operation_id) or None
     )
     intent = make_intent(policy_id)
 
@@ -168,7 +168,7 @@ def test_executor_exception_becomes_unknown_and_is_not_retried(tmp_path):
     assert first.status is OperationStatus.UNKNOWN
     assert retry == first
     assert len(calls) == 1
-    assert "sensitive" not in (first.result or "")
+    assert first.result == "Executor raised an exception; outcome may be unknown."
 
 
 def test_crash_after_durable_claim_never_triggers_automatic_retry(tmp_path):
@@ -222,7 +222,7 @@ def test_executor_receives_the_same_immutable_intent_that_was_canonicalized(tmp_
         store,
         lambda intent, operation_id: observed.append(
             (intent, intent.canonical_json, operation_id)
-        ) or "ok",
+        ) and None,
     )
     intent = make_intent(policy_id, amount="10.00")
 
