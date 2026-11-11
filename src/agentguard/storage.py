@@ -104,7 +104,7 @@ class SQLitePolicyStore:
                         result TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
-                        UNIQUE (policy_id, idempotency_key),
+                        UNIQUE (idempotency_key),
                         FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
                     )"""
                 )
@@ -308,13 +308,16 @@ class SQLitePolicyStore:
 
             previous = connection.execute(
                 """SELECT * FROM gateway_operations
-                WHERE policy_id = ? AND idempotency_key = ?""",
-                (policy_id, idempotency_key),
+                WHERE idempotency_key = ?""",
+                (idempotency_key,),
             ).fetchone()
             if previous is not None:
-                if previous["canonical_intent"] != canonical_intent:
+                if (
+                    previous["policy_id"] != policy_id
+                    or previous["canonical_intent"] != canonical_intent
+                ):
                     raise IdempotencyConflict(
-                        "idempotency_key has already been used with a different action intent."
+                        "idempotency_key has already been used with a different policy or action intent."
                     )
                 operation = self._gateway_operation(previous)
                 connection.commit()
@@ -452,8 +455,8 @@ class SQLitePolicyStore:
         try:
             row = connection.execute(
                 """SELECT * FROM gateway_operations
-                WHERE policy_id = ? AND idempotency_key = ?""",
-                (policy_id, idempotency_key),
+                WHERE idempotency_key = ?""",
+                (idempotency_key,),
             ).fetchone()
         finally:
             connection.close()
