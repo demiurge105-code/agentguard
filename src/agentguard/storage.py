@@ -394,18 +394,48 @@ class SQLitePolicyStore:
         finally:
             connection.close()
 
-    def claim_gateway_operation(self, operation_id: str) -> bool:
-        """Atomically claim an approved operation for its single executor attempt."""
+    def claim_gateway_operation(
+        self,
+        operation_id: str,
+        agent_token: str,
+    ) -> bool | None:
+        """Authenticate the current token and claim APPROVED atomically.
+
+        Return None when credentials are invalid, False when the operation is
+        not claimable, and True only after the EXECUTING transition commits.
+        """
+        if not isinstance(agent_token, str) or not agent_token or agent_token.strip() != agent_token:
+            return None
         connection = self._connect()
         try:
-            with connection:
-                cursor = connection.execute(
-                    """UPDATE gateway_operations
-                    SET status = 'EXECUTING', updated_at = ?
-                    WHERE operation_id = ? AND status = 'APPROVED'""",
-                    (datetime.now(timezone.utc).isoformat(), operation_id),
-                )
-                return cursor.rowcount == 1
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT gateway_operations.status, policies.agent_token_hash
+                FROM gateway_operations
+                JOIN policies ON policies.policy_id = gateway_operations.policy_id
+                WHERE gateway_operations.operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            if row is None or row["status"] != "APPROVED":
+                connection.commit()
+                return False
+            supplied_hash = hashlib.sha256(agent_token.encode("utf-8")).hexdigest()
+            stored_hash = row["agent_token_hash"]
+            if not stored_hash or not hmac.compare_digest(stored_hash, supplied_hash):
+                connection.commit()
+                return None
+            cursor = connection.execute(
+                """UPDATE gateway_operations
+                SET status = 'EXECUTING', updated_at = ?
+                WHERE operation_id = ? AND status = 'APPROVED'""",
+                (datetime.now(timezone.utc).isoformat(), operation_id),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
