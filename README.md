@@ -165,7 +165,7 @@ python examples/demo_agent.py
 
 Both processes must use the same `AGENTGUARD_DB_PATH`. If unset, each uses `agentguard.db` in its current working directory, so run both from the repository root or set the same absolute path in both terminals. The demo accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
 
-All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The gateway is an in-process application boundary, not a sandbox against malicious Python code running with the same process privileges. The existing `/check-transaction` API remains available for backward compatibility, but it is not protected by the gateway in this milestone.
+All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The gateway is an in-process application boundary, not a sandbox against malicious Python code running with the same process privileges. The existing `/check-transaction` API remains available for backward compatibility and is separate from the gateway execution endpoint.
 
 ### Create a policy
 
@@ -223,6 +223,31 @@ Content-Type: application/json
 
 The response contains `allowed`, `reason_code`, and `reason`. Missing, invalid, and cross-policy tokens return HTTP 401 without revealing whether the policy ID exists. The endpoint loads policy limits and recipients from SQLite; callers cannot override them in the request.
 
+### Submit an action through the Gateway
+
+`POST /gateway/operations` sends a proposed action through the in-process Trusted Execution Gateway. Unlike `/check-transaction`, this endpoint owns the print-only executor and returns a persisted operation state.
+
+```http
+POST /gateway/operations
+Authorization: Bearer <agent-token>
+Idempotency-Key: <unique-key>
+Content-Type: application/json
+
+{
+  "policy_id": "<policy-id-returned-when-created>",
+  "amount": "25",
+  "recipient": "0xABC"
+}
+```
+
+The caller must provide a globally unique `Idempotency-Key`. Repeating the same key with the same policy and canonical action returns the stored operation without invoking the executor again. Reusing it with another policy or action returns HTTP 409.
+
+The response includes `operation_id`, `status`, `allowed`, `reason_code`, `reason`, and timestamps. A policy denial is returned as HTTP 200 with status `DENIED`; invalid or missing credentials return HTTP 401 without revealing whether the policy exists. Invalid payloads return HTTP 422.
+
+The endpoint loads the chain identifier from the stored policy. The request cannot override `chain_id`, limits, daily spending, or executor parameters. Monetary amounts must be decimal strings. The endpoint uses `PrintOnlyExecutor`: `SUCCEEDED` means the simulation completed, not that a blockchain transaction was sent.
+
+The existing `/check-transaction` endpoint remains available for policy evaluation and budget reservation without execution.
+
 ### Rotate an agent token
 
 `POST /policies/{policy_id}/rotate-agent-token` requires the owner token:
@@ -254,7 +279,7 @@ The current implementation consists of:
 - **Chain adapters** — validate EVM CAIP-2 chain identifiers and normalize EVM addresses; other chain namespaces are not implemented yet.
 - **Policy engine** — evaluates a request and returns a deterministic decision.
 - **SQLite policy store** — persists policies, agent-token hashes, daily reservations, and gateway operation states separately from the policy engine.
-- **Trusted Execution Gateway** — authenticates and reserves atomically, binds idempotency keys to canonical intents, and owns the only executor reference used by the demo.
+- **Trusted Execution Gateway** — authenticates and reserves atomically, binds idempotency keys to canonical intents, and owns the print-only executor exposed through `/gateway/operations`.
 - **FastAPI interface** — exposes owner-authenticated policy management and the backward-compatible agent-authenticated transaction-evaluation endpoint.
 - **Tests and examples** — demonstrate and verify the simulation behaviour.
 
