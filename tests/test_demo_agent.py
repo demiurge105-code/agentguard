@@ -159,7 +159,7 @@ def test_run_demo_submits_both_proposals_through_gateway_endpoint(monkeypatch, c
 
     output = capsys.readouterr().out
     assert "APPROVED" in output
-    assert "QUEUED" in output
+    assert "durably queued" in output
     assert "DENIED" in output
     assert len(calls) == 2
     assert calls[0][0] == {
