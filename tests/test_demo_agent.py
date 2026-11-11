@@ -121,7 +121,7 @@ def test_api_request_adds_idempotency_header_without_overriding_auth(monkeypatch
         "/gateway/operations",
         {"amount": "1"},
         "agent-token",
-        extra_headers={"Idempotency-Key": "unique-key"},
+        idempotency_key="unique-key",
     )
 
     assert result == {"ok": True}
@@ -134,7 +134,7 @@ def test_run_demo_submits_both_proposals_through_gateway_endpoint(monkeypatch, c
     policy_id = "123e4567-e89b-12d3-a456-426614174000"
     agent_token = "agent-secret-token"
 
-    def fake_api_request(base_url, path, payload, bearer_token, extra_headers=None):
+    def fake_api_request(base_url, path, payload, bearer_token, idempotency_key=None):
         assert base_url == "http://127.0.0.1:8000"
         if path == "/policies":
             assert bearer_token == "admin-secret-token"
@@ -142,8 +142,8 @@ def test_run_demo_submits_both_proposals_through_gateway_endpoint(monkeypatch, c
 
         assert path == "/gateway/operations"
         assert bearer_token == agent_token
-        assert extra_headers and extra_headers["Idempotency-Key"].startswith("demo-")
-        calls.append((payload, extra_headers["Idempotency-Key"]))
+        assert isinstance(idempotency_key, str) and idempotency_key.startswith("demo-")
+        calls.append((payload, idempotency_key))
         index = len(calls)
         return {
             "operation_id": f"operation-{index}",
@@ -199,7 +199,7 @@ def test_run_demo_rejects_incomplete_policy_response_without_printing_credential
 
 
 def test_run_demo_stops_when_gateway_request_fails(monkeypatch):
-    def failing_api_request(base_url, path, payload, token, extra_headers=None):
+    def failing_api_request(base_url, path, payload, token, idempotency_key=None):
         if path == "/policies":
             return {
                 "policy_id": "123e4567-e89b-12d3-a456-426614174000",
