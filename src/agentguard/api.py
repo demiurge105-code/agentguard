@@ -354,17 +354,20 @@ def create_app(
         require_admin(credentials)
         try:
             operation = get_store().get_gateway_operation_by_id(operation_id)
+            execution_status = get_store().get_gateway_execution_status(operation_id)
         except sqlite3.Error as error:
             raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
         if operation is None:
             raise HTTPException(status_code=404, detail="Gateway operation not found.")
-        return {
+        response = {
             key: operation[key]
             for key in (
                 "operation_id", "policy_id", "status", "reservation_status", "allowed",
                 "reason_code", "reason", "result", "created_at", "updated_at",
             )
         }
+        response["execution_status"] = execution_status or "NOT_QUEUED"
+        return response
 
     @application.get("/gateway/operations/{operation_id}/events")
     def get_gateway_operation_events(
