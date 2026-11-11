@@ -24,6 +24,28 @@ class GatewayAuthenticationError(PermissionError):
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionOutcome:
+    """Trusted executor result; FAILED requires confirmation of no side effect."""
+
+    status: OperationStatus
+    no_side_effect_confirmed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.status not in {
+            OperationStatus.SUCCEEDED,
+            OperationStatus.FAILED,
+            OperationStatus.UNKNOWN,
+        }:
+            raise ValueError("ExecutionOutcome requires a terminal operation status.")
+        if type(self.no_side_effect_confirmed) is not bool:
+            raise ValueError("no_side_effect_confirmed must be a boolean.")
+        if self.status is OperationStatus.FAILED and not self.no_side_effect_confirmed:
+            raise ValueError("FAILED requires confirmation that no side effect occurred.")
+        if self.status is not OperationStatus.FAILED and self.no_side_effect_confirmed:
+            raise ValueError("No-side-effect confirmation is valid only for FAILED.")
+
+
+@dataclass(frozen=True, slots=True)
 class OperationResult:
     operation_id: str
     policy_id: str
@@ -37,7 +59,7 @@ class OperationResult:
     updated_at: str
 
 
-Executor = Callable[[ActionIntent, str], None]
+Executor = Callable[[ActionIntent, str], object]
 
 
 def _result_from_record(record: dict[str, object]) -> OperationResult:
@@ -132,20 +154,34 @@ class TrustedExecutionGateway:
                     "Executor outcome is uncertain and could not be persisted."
                 ) from error
         else:
-            if execution_result is not None:
+            if isinstance(execution_result, ExecutionOutcome):
+                terminal_status = execution_result.status
+                no_side_effect_confirmed = execution_result.no_side_effect_confirmed
+                stored_result = {
+                    OperationStatus.SUCCEEDED: "Execution completed.",
+                    OperationStatus.FAILED: "Trusted executor confirmed no side effect occurred.",
+                    OperationStatus.UNKNOWN: "Execution outcome is uncertain.",
+                }[terminal_status]
+            elif execution_result is not None:
                 terminal_status = OperationStatus.UNKNOWN
+                no_side_effect_confirmed = False
                 stored_result = "Executor returned unsupported data; outcome may be unknown."
             else:
                 terminal_status = OperationStatus.SUCCEEDED
+                no_side_effect_confirmed = False
                 # Persist only a fixed status message, never arbitrary executor
                 # output that could accidentally contain credentials or secrets.
                 stored_result = "Execution completed."
 
-            stored = self._store.complete_gateway_operation(
-                operation.operation_id,
-                terminal_status.value,
-                stored_result,
-            )
+            if terminal_status is OperationStatus.FAILED:
+                stored = self._store.complete_gateway_operation(
+                    operation.operation_id, terminal_status.value, stored_result,
+                    no_side_effect_confirmed=True,
+                )
+            else:
+                stored = self._store.complete_gateway_operation(
+                    operation.operation_id, terminal_status.value, stored_result,
+                )
             if not stored:
                 raise RuntimeError(
                     "Executor returned but its outcome could not be persisted."
