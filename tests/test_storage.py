@@ -285,3 +285,20 @@ def test_path_object_for_in_memory_database_is_rejected():
 
     with pytest.raises(ValueError, match="file-based database path"):
         SQLitePolicyStore(Path(":memory:"))
+
+
+
+@pytest.mark.parametrize("amount", [0.1, 1.5, True, False])
+def test_storage_rejects_float_and_boolean_amounts_before_reserving(tmp_path, amount):
+    store = SQLitePolicyStore(tmp_path / "strict-decimal.db")
+    policy_id = store.create_policy(make_policy("100"))
+
+    with pytest.raises(ValueError, match="Decimal or decimal string"):
+        store.evaluate_and_reserve(policy_id, amount, "Alice", "invalid-number")
+
+    # Reusing the same key with a valid decimal proves the rejected input
+    # did not create an idempotency reservation.
+    decision = store.evaluate_and_reserve(
+        policy_id, "10", "Alice", "invalid-number"
+    )
+    assert decision.allowed is True
