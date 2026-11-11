@@ -1,4 +1,4 @@
-"""Run a deterministic, simulation-only agent against a local AgentGuard API.
+"""Run a deterministic, simulation-only agent through the local Gateway v1.
 
 Start the API first, then run: python examples/demo_agent.py
 """
@@ -6,13 +6,22 @@ Start the API first, then run: python examples/demo_agent.py
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 import os
+import sqlite3
 import uuid
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+from agentguard.gateway import (
+    GatewayAuthenticationError,
+    OperationStatus,
+    PrintOnlyExecutor,
+    TrustedExecutionGateway,
+)
+from agentguard.intent import ActionIntent
+from agentguard.storage import SQLitePolicyStore
 
 
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -73,52 +82,11 @@ def api_request(
     return result
 
 
-@dataclass(frozen=True)
-class TransactionIntent:
-    """Immutable transaction data shared by the policy check and executor."""
-
-    description: str
-    amount: Decimal
-    recipient: str
-
-    def __init__(
-        self,
-        description: str,
-        amount: Decimal | str,
-        recipient: str,
-    ) -> None:
-        if not isinstance(description, str) or not description.strip():
-            raise ValueError("description must not be empty.")
-        if isinstance(amount, (bool, float)):
-            raise ValueError("amount must be a Decimal or decimal string, not a float.")
-        try:
-            parsed_amount = Decimal(amount)
-        except (InvalidOperation, TypeError, ValueError) as error:
-            raise ValueError("amount must be a valid decimal value.") from error
-        if not parsed_amount.is_finite() or parsed_amount <= 0:
-            raise ValueError("amount must be a finite decimal value greater than zero.")
-        if not isinstance(recipient, str) or not recipient.strip():
-            raise ValueError("recipient must not be empty.")
-
-        object.__setattr__(self, "description", description.strip())
-        object.__setattr__(self, "amount", parsed_amount)
-        object.__setattr__(self, "recipient", recipient.strip())
-
-    @property
-    def amount_text(self) -> str:
-        """Return an exact, non-exponent decimal representation for the API."""
-        return format(self.amount, "f")
-
-
-def simulate_execution(intent: TransactionIntent) -> None:
-    """Represent a downstream executor without performing external side effects."""
-    print(
-        f"  Simulated executor: would execute {intent.amount_text} units "
-        f"to {intent.recipient} ({intent.description})."
-    )
-
-
-def run_demo(base_url: str, admin_token: str) -> None:
+def run_demo(
+    base_url: str,
+    admin_token: str,
+    db_path: str | Path = "agentguard.db",
+) -> None:
     print("Creating a demo policy...")
     policy = api_request(
         base_url,
@@ -130,47 +98,54 @@ def run_demo(base_url: str, admin_token: str) -> None:
         },
         admin_token,
     )
-    policy_id = policy["policy_id"]
-    agent_token = policy["agent_token"]
+    policy_id = policy.get("policy_id")
+    agent_token = policy.get("agent_token")
+    if not isinstance(policy_id, str) or not isinstance(agent_token, str):
+        raise RuntimeError("Policy creation response is missing its policy ID or agent token.")
+
+    # The API and this local demo must use the same configured SQLite database.
+    store = SQLitePolicyStore(db_path)
+    if store.get_policy(policy_id) is None:
+        raise RuntimeError(
+            "The created policy was not found in AGENTGUARD_DB_PATH. "
+            "Start the API and demo with the same database path."
+        )
+
+    gateway = TrustedExecutionGateway(store, PrintOnlyExecutor())
     print(f"Policy created: {policy_id}")
     print("Agent token received and kept in memory (not displayed).")
     print()
 
-    # This deterministic demo agent proposes hypothetical actions.
+    # The proposal logic receives the gateway, not an executor reference.
     proposals = (
-        TransactionIntent(
-            "Small transfer to an approved recipient", "25", "0xDemoRecipient"
-        ),
-        TransactionIntent(
-            "Transfer above the per-transaction limit", "75", "0xDemoRecipient"
-        ),
+        ("Small transfer to an approved recipient", "25", "0xDemoRecipient"),
+        ("Transfer above the per-transaction limit", "75", "0xDemoRecipient"),
     )
 
-    for intent in proposals:
-        print(f"Agent proposal: {intent.description}")
-        print(f"  Amount: {intent.amount_text}")
+    for description, amount, recipient in proposals:
+        intent = ActionIntent(policy_id, amount, recipient)
+        print(f"Agent proposal: {description}")
+        print(f"  Amount: {intent.amount}")
         print(f"  Recipient: {intent.recipient}")
-        decision = api_request(
-            base_url,
-            "/check-transaction",
-            {
-                "policy_id": policy_id,
-                "request_id": f"demo-{uuid.uuid4().hex}",
-                "amount": intent.amount_text,
-                "recipient": intent.recipient,
-            },
-            agent_token,
-        )
-        allowed = decision.get("allowed") is True
-        label = "ALLOW" if allowed else "DENY"
-        print(f"  AgentGuard: {label}")
-        print(f"  Reason: {decision.get('reason', 'No reason returned')}")
 
-        # Fail closed: only the literal boolean True reaches the simulated executor.
-        if allowed:
-            simulate_execution(intent)
+        result = gateway.submit(
+            intent,
+            agent_token,
+            idempotency_key=f"demo-{uuid.uuid4().hex}",
+        )
+        label = "ALLOW" if result.allowed is True else "DENY"
+        print(f"  AgentGuard: {label} ({result.status.value})")
+        print(f"  Reason: {result.reason}")
+
+        if result.status is OperationStatus.SUCCEEDED:
+            print(f"  Operation: {result.operation_id}")
+        elif result.status is OperationStatus.DENIED:
+            print("  Gateway: executor was not called.")
         else:
-            print("  Simulated executor: skipped (AgentGuard did not explicitly allow).")
+            print(
+                "  Gateway: operation is unresolved; it will not be "
+                "automatically executed again."
+            )
         print()
 
     print("Demo complete. No wallet was connected and no transaction was sent.")
@@ -186,8 +161,16 @@ def main() -> int:
         base_url = local_api_url(
             os.getenv("AGENTGUARD_API_URL", "http://127.0.0.1:8000")
         )
-        run_demo(base_url, admin_token)
-    except (ValueError, RuntimeError, URLError) as error:
+        db_path = os.getenv("AGENTGUARD_DB_PATH", "agentguard.db")
+        run_demo(base_url, admin_token, db_path)
+    except (
+        ValueError,
+        RuntimeError,
+        PermissionError,
+        URLError,
+        OSError,
+        sqlite3.Error,
+    ) as error:
         print(f"Demo failed: {error}")
         return 1
     return 0
