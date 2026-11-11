@@ -31,6 +31,8 @@ class ExecutionOutcome:
     no_side_effect_confirmed: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, OperationStatus):
+            raise ValueError("ExecutionOutcome status must be an OperationStatus.")
         if self.status not in {
             OperationStatus.SUCCEEDED,
             OperationStatus.FAILED,
