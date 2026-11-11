@@ -4,7 +4,9 @@
 
 AgentGuard is an experimental, simulation-only policy evaluation service for proposed crypto transactions from AI agents. It does not connect to wallets, sign transactions, or submit blockchain transactions.
 
-## Core flow
+## API evaluation flow
+
+The backward-compatible HTTP policy-check flow remains:
 
 1. The policy owner creates a policy through `POST /policies` using the owner token.
 2. The API generates a cryptographically random agent token, stores only its SHA-256 hash with the policy, and returns the raw token once.
@@ -13,7 +15,24 @@ AgentGuard is an experimental, simulation-only policy evaluation service for pro
 5. The SQLite store serializes evaluation and reservation in a write transaction.
 6. The API returns an `ALLOW` or `DENY` decision with a stable reason code.
 
-The deterministic demo uses a frozen `TransactionIntent` value object for each proposal. Its `Decimal` amount and recipient are serialized into the API check request, and the same object is passed to the simulated executor only after an explicit boolean `allowed: true`. This keeps the checked values and simulated values aligned within the cooperative demo process. It does not create a server-verifiable approval token, isolate the executor, or prevent an agent with another execution path from bypassing AgentGuard.
+## Gateway demo flow
+
+The canonical `examples/demo_agent.py` now exercises the in-process `TrustedExecutionGateway` rather than calling `/check-transaction` and then invoking its own executor.
+
+1. The demo creates a policy through the local API.
+2. It opens the same SQLite database configured by `AGENTGUARD_DB_PATH` and verifies that the policy exists.
+3. Each proposal is converted into the core immutable `ActionIntent`.
+4. The demo submits the intent, agent token, and idempotency key to `TrustedExecutionGateway`. The proposal logic receives the gateway, not the executor reference.
+5. The store authenticates the token, binds the globally unique idempotency key to the policy and canonical intent, evaluates policy, reserves budget, and persists the initial operation in one `BEGIN IMMEDIATE` transaction.
+6. Before execution, the store revalidates the current agent token and atomically claims `APPROVED -> EXECUTING`. Only one concurrent retry can win this transition.
+7. The gateway passes the same immutable `ActionIntent` and stable operation ID to `PrintOnlyExecutor`. The print-only executor sends no transaction.
+8. The gateway persists `SUCCEEDED` or `UNKNOWN`. Executor exceptions and arbitrary executor return data are not stored. An ambiguous operation is never automatically executed again.
+
+The operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. `FAILED` is reserved for a future executor contract that can prove no side effect occurred. If the process crashes after `EXECUTING` is committed, the operation remains unresolved until manually reconciled; retries do not invoke the executor again.
+
+Idempotency keys are globally unique within the SQLite database. Reuse with a different policy or canonical intent conflicts. Gateway reservations use a random operation-scoped reservation ID rather than the caller-provided key, avoiding collisions with legacy `/check-transaction` request IDs.
+
+This is an in-process application boundary, not a Python sandbox. Malicious code with the same process privileges can still import internal modules or use independent execution capabilities. The existing `/check-transaction` endpoint remains separate and is not protected by this gateway yet.
 
 ## Components
 
@@ -46,8 +65,25 @@ Public methods:
 - `rotate_agent_token(policy_id, token_hash) -> bool`
 - `get_policy(policy_id) -> Policy | None`
 - `evaluate_and_reserve(policy_id, amount, recipient, request_id) -> Decision | None`
+- `begin_gateway_operation(intent, agent_token, idempotency_key) -> operation | None`
+- `claim_gateway_operation(operation_id, agent_token) -> bool | None`
+- `complete_gateway_operation(operation_id, status, result=None) -> bool`
+- `get_gateway_operation(policy_id, idempotency_key) -> operation | None`
+- `mark_gateway_operation_unknown(operation_id) -> bool`
 
 Policy limits and transaction amounts are stored as decimal strings. Recipient allowlists are stored as JSON. The nullable `policies.chain_id` column binds a policy to its chain; older databases are migrated with `chain_id = NULL` and therefore remain in legacy mode. The `policies.agent_token_hash` column stores only a SHA-256 hexadecimal digest; raw agent tokens are never written to SQLite. The `daily_reservations` table records each request's UTC date, amount, recipient, and decision.
+
+### Trusted Execution Gateway
+
+Implemented in `agentguard.gateway.TrustedExecutionGateway`.
+
+The gateway owns a callable executor reference and accepts only a validated `ActionIntent`. The store persists an operation row with a globally unique idempotency key and exact canonical intent. Authentication, policy evaluation, budget reservation, and initial operation creation share one SQLite write transaction. A second atomic transaction revalidates the current token and claims the operation for execution.
+
+Only the request that changes `APPROVED` to `EXECUTING` may call the executor. Retries return the stored state. Concurrent retries cannot claim the same operation twice. The gateway never automatically re-executes an operation left in `EXECUTING` after a crash. Operators can explicitly mark such an operation `UNKNOWN`, but this does not authorize a retry.
+
+The current `PrintOnlyExecutor` only prints a simulated action. Arbitrary executor return values and exception messages are not stored. `FAILED` is reserved for a future executor contract that can establish that no side effect occurred; ambiguous outcomes are recorded as `UNKNOWN`.
+
+The gateway is not a sandbox and does not protect against malicious same-process Python code. The demo is wired through the gateway, but the legacy HTTP `/check-transaction` endpoint is not. No gateway HTTP endpoint, wallet, signer, RPC, broadcasting, reservation settlement, or real-fund execution is implemented.
 
 ### Agent token lifecycle
 
@@ -102,7 +138,7 @@ For EVM-bound policies, the recipient must be a valid 20-byte hexadecimal EVM ad
 
 ## Security scope and limitations
 
-AgentGuard is not a wallet security system. It does not hold keys, sign transactions, submit transactions, or stop an agent from bypassing the API. Agent tokens authenticate access to the policy-evaluation endpoint; they are not proof of wallet ownership. Reservations are not reconciled with actual blockchain settlement. Do not use the API as the sole control protecting real funds.
+AgentGuard is not a wallet security system. It does not hold keys, sign transactions, submit transactions, or stop malicious code from bypassing the gateway or API. Agent tokens authenticate access to the policy-evaluation endpoint and in-process gateway; they are not proof of wallet ownership. The legacy /check-transaction endpoint is not yet routed through the gateway. Reservations are not reconciled with actual blockchain settlement. Do not use this system as the sole control protecting real funds.
 
 ## Technology
 
