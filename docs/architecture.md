@@ -69,7 +69,9 @@ Public methods:
 - `claim_gateway_operation(operation_id, agent_token) -> bool | None`
 - `complete_gateway_operation(operation_id, status, result=None) -> bool`
 - `get_gateway_operation(policy_id, idempotency_key) -> operation | None`
-- `mark_gateway_operation_unknown(operation_id) -> bool`
+- `get_gateway_operation_by_id(operation_id) -> operation | None`
+- `list_gateway_operation_events(operation_id) -> events | None`
+- `reconcile_gateway_operation_unknown(operation_id, actor_id, reason) -> bool`
 
 Policy limits and transaction amounts are stored as decimal strings. Recipient allowlists are stored as JSON. The nullable `policies.chain_id` column binds a policy to its chain; older databases are migrated with `chain_id = NULL` and therefore remain in legacy mode. The `policies.agent_token_hash` column stores only a SHA-256 hexadecimal digest; raw agent tokens are never written to SQLite. The `daily_reservations` table records each request's UTC date, amount, recipient, and decision.
 
@@ -83,7 +85,11 @@ Only the request that changes `APPROVED` to `EXECUTING` may call the executor. R
 
 The current `PrintOnlyExecutor` only prints a simulated action. Arbitrary executor return values and exception messages are not stored. `FAILED` is reserved for a future executor contract that can establish that no side effect occurred; ambiguous outcomes are recorded as `UNKNOWN`.
 
-The gateway is not a sandbox and does not protect against malicious same-process Python code. The demo is wired through the gateway, but the legacy HTTP `/check-transaction` endpoint is not. No gateway HTTP endpoint, wallet, signer, RPC, broadcasting, reservation settlement, or real-fund execution is implemented.
+Every operation creation and subsequent status transition is accompanied by an append-only `gateway_operation_events` row in the same SQLite transaction. Events include transition, actor type/identifier, bounded reason, and timestamp, but never credentials or arbitrary executor data. Existing operations are migrated with a `LEGACY_IMPORT` event that explicitly states earlier transitions are unavailable.
+
+The owner-authenticated API can inspect an operation and its events. An owner can reconcile only `EXECUTING -> UNKNOWN`, with a required reason. There is deliberately no manual API transition to `SUCCEEDED` or `FAILED`: without an executor-specific verification contract, an operator assertion is not independent evidence. Reconciliation never authorizes another execution attempt. The event log is append-only through the application API, but it is not tamper-proof against a database or host administrator.
+
+The gateway is not a sandbox and does not protect against malicious same-process Python code. The demo is wired through the gateway, but the legacy HTTP `/check-transaction` endpoint is not. The authenticated gateway HTTP endpoint, wallet, signer, RPC, broadcasting, reservation settlement, and real-fund execution remain distinct concerns.
 
 ### Agent token lifecycle
 
