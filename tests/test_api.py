@@ -523,3 +523,59 @@ def test_bearer_authentication_is_declared_in_openapi(app):
         "/check-transaction",
     ):
         assert {"HTTPBearer": []} in schema["paths"][path]["post"]["security"]
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_transaction", 0.1),
+        ("max_transaction", 1),
+        ("max_transaction", True),
+        ("daily_limit", 0.1),
+        ("daily_limit", 1),
+        ("daily_limit", True),
+    ],
+)
+async def test_policy_creation_rejects_json_numeric_money_values(
+    app, admin_token, field, value
+):
+    payload = {
+        "max_transaction": "100",
+        "daily_limit": "500",
+        "allowed_recipients": ["Alice", "Bob"],
+    }
+    payload[field] = value
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await create_policy(client, admin_token, payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("value", [0.1, 1, True])
+async def test_transaction_api_rejects_json_numeric_amount_without_reserving(
+    app, admin_token, value
+):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+
+        rejected = await check(
+            client,
+            created["policy_id"],
+            "strict-decimal-input",
+            created["agent_token"],
+            amount=value,
+        )
+        accepted = await check(
+            client,
+            created["policy_id"],
+            "strict-decimal-input",
+            created["agent_token"],
+            amount="10",
+        )
+
+    assert rejected.status_code == 422
+    assert accepted.status_code == 200
+    assert accepted.json()["allowed"] is True
+
