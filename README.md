@@ -167,9 +167,21 @@ $env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
 python examples/demo_agent.py
 ```
 
-The API server uses `AGENTGUARD_DB_PATH` for SQLite; if unset, it uses `agentguard.db` in its current working directory. The demo does not access this file directly. It accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+The API server and worker must use the same `AGENTGUARD_DB_PATH`. The API stores an approved execution job in SQLite and returns `APPROVED` with `execution_status: QUEUED`; it does not call the executor. Start a separate worker process from the repository root:
 
-All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The gateway is an in-process application boundary, not a sandbox against malicious Python code running with the same process privileges. The existing `/check-transaction` API remains available for backward compatibility and is separate from the gateway execution endpoint.
+```bash
+agentguard-worker
+```
+
+Or run one polling cycle:
+
+```bash
+agentguard-worker --once
+```
+
+The worker uses the same database path, claims jobs with a bounded lease, and prints simulated execution results. The demo itself only submits proposals; run the worker in a second terminal to process approved jobs. The demo accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+
+All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The worker is a separate process, but this is not a hardened sandbox or a distributed execution service. The existing `/check-transaction` API remains available for backward compatibility and is separate from the gateway execution endpoint.
 
 ### Create a policy
 
@@ -316,9 +328,9 @@ The current implementation consists of:
 - **Policy and request models** — validate policy limits, transaction amounts, and recipient identifiers.
 - **Chain adapters** — validate EVM CAIP-2 chain identifiers and normalize EVM addresses; other chain namespaces are not implemented yet.
 - **Policy engine** — evaluates a request and returns a deterministic decision.
-- **SQLite policy store** — persists policies, agent-token hashes, daily reservations, and gateway operation states separately from the policy engine.
-- **Trusted Execution Gateway** — authenticates and reserves atomically, binds idempotency keys to canonical intents, and owns the print-only executor exposed through `/gateway/operations`.
-- **FastAPI interface** — exposes owner-authenticated policy management, the backward-compatible `/check-transaction` endpoint, and the authenticated `/gateway/operations` execution endpoint.
+- **SQLite policy store** — persists policies, agent-token hashes, daily reservations, gateway operations, and a durable execution-job outbox.
+- **Execution worker** — claims queued jobs with expiring pre-dispatch leases and monotonically increasing fencing tokens; only a current worker can cross the dispatch boundary or persist its result.
+- **FastAPI interface** — exposes owner-authenticated policy management, the backward-compatible `/check-transaction` endpoint, and an enqueue-only `/gateway/operations` endpoint.
 - **Tests and examples** — demonstrate and verify the simulation behaviour.
 
 See [docs/architecture.md](docs/architecture.md) for more detail.
@@ -327,10 +339,9 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 
 Planned areas of work include:
 
-1. A dedicated gateway HTTP integration so remote agents can submit operations without accessing the SQLite store directly.
-2. Stronger audit integrity beyond the application-level append-only event history.
-3. External developer feedback and independent security review.
-4. Process isolation and further research before any wallet or testnet execution integration.
+1. Stronger audit integrity beyond the application-level append-only event history.
+2. External developer feedback and independent security review.
+3. Hardening the worker boundary and operational recovery before considering any external executor integration.
 
 The roadmap may change as the project is tested with developers and potential users.
 
