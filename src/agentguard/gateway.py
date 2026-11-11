@@ -100,7 +100,15 @@ class TrustedExecutionGateway:
         if operation.allowed is not True or operation.reason_code != "allowed":
             raise RuntimeError("Gateway refused an inconsistent or malformed approval record.")
 
-        if not self._store.claim_gateway_operation(operation.operation_id):
+        claimed = self._store.claim_gateway_operation(
+            operation.operation_id,
+            agent_token,
+        )
+        if claimed is None:
+            raise GatewayAuthenticationError(
+                "Agent token is invalid or was revoked before execution."
+            )
+        if not claimed:
             current = self._store.get_gateway_operation(
                 operation.policy_id,
                 operation.idempotency_key,
