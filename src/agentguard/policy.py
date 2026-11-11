@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from enum import Enum
 from typing import Iterable
 
 from agentguard.chains import normalize_chain_id, normalize_recipient
+
+
+# Bounds keep exact monetary arithmetic predictable and prevent pathological
+# Decimal exponents or coefficient sizes from consuming excessive resources.
+MAX_DECIMAL_DIGITS = 128
+MAX_DECIMAL_EXPONENT = 128
+# A daily aggregate can span the full supported exponent range while remaining
+# at or below a 128-digit daily limit. This requires at most 384 coefficient digits.
+MAX_AGGREGATE_DECIMAL_DIGITS = MAX_DECIMAL_DIGITS + 2 * MAX_DECIMAL_EXPONENT
+EXACT_ARITHMETIC_PRECISION = 512
 
 
 class DecisionReason(str, Enum):
@@ -72,7 +82,11 @@ class TransactionRequest:
         daily_spent: Decimal | str,
     ) -> None:
         transaction_amount = _as_decimal(amount, "amount")
-        spent_today = _as_decimal(daily_spent, "daily_spent")
+        spent_today = _as_decimal(
+            daily_spent,
+            "daily_spent",
+            max_digits=MAX_AGGREGATE_DECIMAL_DIGITS,
+        )
         if transaction_amount <= 0:
             raise ValueError("amount must be greater than zero.")
         if spent_today < 0:
@@ -118,7 +132,15 @@ def check_transaction(request: TransactionRequest, policy: Policy) -> Decision:
             DecisionReason.AMOUNT_EXCEEDS_MAXIMUM,
             "Transaction exceeds the maximum transaction limit.",
         )
-    if request.daily_spent + request.amount > policy.daily_limit:
+    # Decimal addition obeys the active context precision (normally 28 digits).
+    # Raise it above the maximum exact width permitted by _as_decimal so a small
+    # excess can never be rounded away at the daily-limit boundary.
+    with localcontext() as context:
+        context.prec = EXACT_ARITHMETIC_PRECISION
+        exceeds_daily_limit = (
+            request.daily_spent + request.amount > policy.daily_limit
+        )
+    if exceeds_daily_limit:
         return _deny(
             DecisionReason.DAILY_LIMIT_EXCEEDED,
             "Transaction would exceed the daily spending limit.",
@@ -135,7 +157,12 @@ def _deny(reason_code: DecisionReason, reason: str) -> Decision:
     return Decision(False, reason_code, reason)
 
 
-def _as_decimal(value: Decimal | str, field_name: str) -> Decimal:
+def _as_decimal(
+    value: Decimal | str,
+    field_name: str,
+    *,
+    max_digits: int = MAX_DECIMAL_DIGITS,
+) -> Decimal:
     if isinstance(value, (bool, float)):
         raise ValueError(
             f"{field_name} must be a Decimal or decimal string, not a float."
@@ -147,4 +174,13 @@ def _as_decimal(value: Decimal | str, field_name: str) -> Decimal:
     # Reject NaN / ±Infinity / sNaN so policy math stays total and comparable (#9).
     if not amount.is_finite():
         raise ValueError(f"{field_name} must be a finite decimal value.")
+
+    parts = amount.as_tuple()
+    if (
+        len(parts.digits) > max_digits
+        or not -MAX_DECIMAL_EXPONENT <= parts.exponent <= MAX_DECIMAL_EXPONENT
+    ):
+        raise ValueError(
+            f"{field_name} exceeds the supported Decimal precision or exponent range."
+        )
     return amount

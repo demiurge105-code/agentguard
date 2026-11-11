@@ -292,3 +292,45 @@ def test_rejects_float_and_boolean_money_inputs(value):
 
     with pytest.raises(ValueError, match="Decimal or decimal string"):
         TransactionRequest("10", "0xABC", value)
+
+
+
+def test_daily_limit_check_does_not_round_away_a_small_excess():
+    policy = Policy("1E+128", "1E+28", ["Alice"])
+    request = TransactionRequest("1", "Alice", "1E+28")
+
+    decision = check_transaction(request, policy)
+
+    assert decision.allowed is False
+    assert decision.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
+
+
+def test_daily_limit_check_allows_exact_large_boundary():
+    policy = Policy("1E+28", "1E+28", ["Alice"])
+    request = TransactionRequest("1", "Alice", "9999999999999999999999999999")
+
+    decision = check_transaction(request, policy)
+
+    assert decision.allowed is True
+    assert decision.reason_code is DecisionReason.ALLOWED
+
+
+@pytest.mark.parametrize("value", ["1E+129", "1E-129", "9" * 129])
+def test_rejects_decimal_values_outside_supported_precision_and_exponent(value):
+    with pytest.raises(ValueError, match="supported Decimal precision or exponent range"):
+        Policy(value, "200", ["Alice"])
+
+
+
+def test_transaction_request_accepts_exact_daily_aggregate_with_129_digits():
+    # A sum of valid reservations may need more coefficient digits than one input.
+    aggregate = Decimal("1." + "0" * 128)
+
+    request = TransactionRequest("1E-128", "Alice", aggregate)
+
+    assert request.daily_spent == Decimal("1")
+
+
+def test_transaction_request_rejects_daily_aggregate_above_supported_bound():
+    with pytest.raises(ValueError, match="supported Decimal precision or exponent range"):
+        TransactionRequest("1", "Alice", Decimal("9" * 385))
