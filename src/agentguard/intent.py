@@ -47,9 +47,12 @@ class ActionIntent:
         if not isinstance(policy_id, str):
             raise ValueError("policy_id must be a UUID string.")
         try:
-            parsed_policy_id = str(UUID(policy_id))
+            parsed_uuid = UUID(policy_id)
         except (ValueError, TypeError, AttributeError) as error:
             raise ValueError("policy_id must be a valid UUID.") from error
+        if policy_id.lower() != str(parsed_uuid):
+            raise ValueError("policy_id must use the canonical UUID format.")
+        parsed_policy_id = str(parsed_uuid)
 
         parsed_amount = _as_decimal(amount, "amount")
         if parsed_amount <= 0:
