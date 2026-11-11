@@ -46,14 +46,14 @@ def api_request(
     path: str,
     payload: dict[str, object],
     bearer_token: str,
-    extra_headers: dict[str, str] | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, object]:
     headers = {
         "Authorization": f"Bearer {bearer_token}",
         "Content-Type": "application/json",
     }
-    if extra_headers:
-        headers.update(extra_headers)
+    if idempotency_key is not None:
+        headers["Idempotency-Key"] = idempotency_key
     request = Request(
         f"{base_url}{path}",
         data=json.dumps(payload).encode("utf-8"),
@@ -122,7 +122,7 @@ def run_demo(base_url: str, admin_token: str) -> None:
                 "recipient": intent.recipient,
             },
             agent_token,
-            extra_headers={"Idempotency-Key": f"demo-{uuid.uuid4().hex}"},
+            idempotency_key=f"demo-{uuid.uuid4().hex}",
         )
         allowed = result.get("allowed") is True
         status_value = result.get("status")
