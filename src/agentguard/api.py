@@ -337,7 +337,7 @@ def create_app(
         return {
             key: operation[key]
             for key in (
-                "operation_id", "policy_id", "status", "allowed",
+                "operation_id", "policy_id", "status", "reservation_status", "allowed",
                 "reason_code", "reason", "result", "created_at", "updated_at",
             )
         }

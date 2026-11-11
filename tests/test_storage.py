@@ -355,7 +355,8 @@ def test_gateway_audit_events_record_each_state_transition_atomically(tmp_path):
     assert store.complete_gateway_operation(operation["operation_id"], "SUCCEEDED", "Execution completed.") is True
     events = store.list_gateway_operation_events(operation["operation_id"])
     assert [(event["previous_status"], event["new_status"]) for event in events] == [
-        (None, "APPROVED"), ("APPROVED", "EXECUTING"), ("EXECUTING", "SUCCEEDED")
+        (None, "APPROVED"), ("APPROVED", "EXECUTING"),
+        ("EXECUTING", "SUCCEEDED"), ("SUCCEEDED", "SUCCEEDED"),
     ]
 
 
@@ -422,3 +423,128 @@ def test_concurrent_owner_reconciliation_creates_only_one_event(tmp_path):
     assert sum(results) == 1
     events = store.list_gateway_operation_events(operation["operation_id"])
     assert sum(event["event_type"] == "MANUAL_RECONCILIATION" for event in events) == 1
+
+
+def test_gateway_success_settles_reservation_and_keeps_daily_usage(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "settle-success.db")
+    token = "settle-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "settle-success")
+    assert operation["reservation_status"] == "RESERVED"
+    assert store.claim_gateway_operation(operation["operation_id"], token)
+    assert store.complete_gateway_operation(operation["operation_id"], "SUCCEEDED", "Execution completed.")
+    inspected = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert inspected["reservation_status"] == "SETTLED"
+    denied = store.begin_gateway_operation(ActionIntent(policy_id, "11", "Alice"), token, "after-settlement")
+    assert denied["status"] == "DENIED"
+    assert store.list_gateway_operation_events(operation["operation_id"])[-1]["event_type"] == "RESERVATION_SETTLED"
+
+
+def test_verified_failure_releases_reservation_and_allows_new_budget(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "release-failure.db")
+    token = "release-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "release-failure")
+    assert store.claim_gateway_operation(operation["operation_id"], token)
+    assert store.complete_gateway_operation(operation["operation_id"], "FAILED", "Trusted executor confirmed no side effect occurred.", no_side_effect_confirmed=True)
+    inspected = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert inspected["status"] == "FAILED" and inspected["reservation_status"] == "RELEASED"
+    next_operation = store.begin_gateway_operation(ActionIntent(policy_id, "15", "Alice"), token, "after-release")
+    assert next_operation["status"] == "APPROVED"
+
+
+def test_released_gateway_budget_is_available_to_legacy_endpoint(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "legacy-after-release.db")
+    token = "legacy-release-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "legacy-release")
+    store.claim_gateway_operation(operation["operation_id"], token)
+    assert store.complete_gateway_operation(operation["operation_id"], "FAILED", no_side_effect_confirmed=True)
+    decision = store.evaluate_and_reserve(policy_id, "15", "Alice", "legacy-after-release")
+    assert decision.allowed is True
+
+def test_failed_status_requires_explicit_no_side_effect_confirmation(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "failed-proof-required.db")
+    token = "proof-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "proof-required")
+    store.claim_gateway_operation(operation["operation_id"], token)
+    with pytest.raises(ValueError, match="no side effect"):
+        store.complete_gateway_operation(operation["operation_id"], "FAILED")
+    inspected = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert inspected["status"] == "EXECUTING" and inspected["reservation_status"] == "RESERVED"
+
+
+def test_unknown_keeps_reservation_active(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "unknown-reservation.db")
+    token = "unknown-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "unknown-reservation")
+    store.claim_gateway_operation(operation["operation_id"], token)
+    assert store.complete_gateway_operation(operation["operation_id"], "UNKNOWN")
+    assert store.get_gateway_operation_by_id(operation["operation_id"])["reservation_status"] == "RESERVED"
+
+
+def test_gateway_completion_is_atomic_with_audit_and_reservation(tmp_path, monkeypatch):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "completion-rollback.db")
+    token = "rollback-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "completion-rollback")
+    store.claim_gateway_operation(operation["operation_id"], token)
+    monkeypatch.setattr(store, "_insert_gateway_event", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("audit write failed")))
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        store.complete_gateway_operation(operation["operation_id"], "SUCCEEDED")
+    inspected = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert inspected["status"] == "EXECUTING" and inspected["reservation_status"] == "RESERVED"
+
+
+def test_concurrent_completion_settles_reservation_once(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "completion-race.db")
+    token = "race-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "completion-race")
+    store.claim_gateway_operation(operation["operation_id"], token)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: store.complete_gateway_operation(operation["operation_id"], "SUCCEEDED"), range(8)))
+    assert sum(results) == 1
+    events = store.list_gateway_operation_events(operation["operation_id"])
+    assert sum(event["event_type"] == "RESERVATION_SETTLED" for event in events) == 1
+    assert store.get_gateway_operation_by_id(operation["operation_id"])["reservation_status"] == "SETTLED"
+
+
+def test_old_reservation_schema_migrates_conservatively(tmp_path):
+    import sqlite3
+    path = tmp_path / "old-reservations.db"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE policies (policy_id TEXT PRIMARY KEY, max_transaction TEXT NOT NULL, daily_limit TEXT NOT NULL, allowed_recipients TEXT NOT NULL, created_at TEXT NOT NULL, chain_id TEXT, agent_token_hash TEXT)")
+        connection.execute("INSERT INTO policies VALUES (?, ?, ?, ?, ?, ?, ?)", ("policy", "100", "200", '["alice"]', "2026-11-11T00:00:00+00:00", None, None))
+        connection.execute("CREATE TABLE daily_reservations (policy_id TEXT NOT NULL, request_id TEXT NOT NULL, utc_day TEXT NOT NULL, amount TEXT NOT NULL, recipient TEXT NOT NULL, allowed INTEGER NOT NULL, reason_code TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY (policy_id, request_id))")
+        connection.execute("INSERT INTO daily_reservations VALUES ('policy', 'gateway:pending-op', '2026-11-11', '10', 'alice', 1, 'allowed', 'ok')")
+        connection.execute("INSERT INTO daily_reservations VALUES ('policy', 'legacy-check', '2026-11-11', '5', 'alice', 1, 'allowed', 'ok')")
+        connection.execute("CREATE TABLE gateway_operations (operation_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, canonical_intent TEXT NOT NULL, status TEXT NOT NULL, allowed INTEGER NOT NULL, reason_code TEXT NOT NULL, reason TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (idempotency_key))")
+        connection.execute("INSERT INTO gateway_operations VALUES ('pending-op', 'policy', 'pending-key', '{}', 'EXECUTING', 1, 'allowed', 'ok', NULL, '2026-11-11T00:00:00+00:00', '2026-11-11T00:00:00+00:00')")
+        connection.commit()
+    finally:
+        connection.close()
+    migrated = SQLitePolicyStore(path)
+    connection = migrated._connect()
+    try:
+        states = {row["request_id"]: row["reservation_status"] for row in connection.execute("SELECT request_id, reservation_status FROM daily_reservations")}
+    finally:
+        connection.close()
+    assert states == {"gateway:pending-op": "RESERVED", "legacy-check": "SETTLED"}

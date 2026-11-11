@@ -972,6 +972,7 @@ async def test_gateway_audit_endpoints_require_owner(app, admin_token):
         events = await client.get(f"/gateway/operations/{operation_id}/events", headers=owner_headers)
     assert [denied.status_code, denied_events.status_code, denied_reconcile.status_code] == [401, 401, 401]
     assert read.status_code == events.status_code == 200
+    assert read.json()["reservation_status"] == "SETTLED"
     assert events.json()["events"][0]["event_type"] == "OPERATION_CREATED"
     assert "agent_token" not in read.json()
 

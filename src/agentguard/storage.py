@@ -83,6 +83,8 @@ class SQLitePolicyStore:
                         allowed INTEGER NOT NULL,
                         reason_code TEXT NOT NULL,
                         reason TEXT NOT NULL,
+                        reservation_status TEXT NOT NULL DEFAULT 'SETTLED'
+                            CHECK (reservation_status IN ('RESERVED', 'SETTLED', 'RELEASED', 'NOT_RESERVED')),
                         PRIMARY KEY (policy_id, request_id),
                         FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
                     )"""
@@ -130,6 +132,36 @@ class SQLitePolicyStore:
                     """CREATE INDEX IF NOT EXISTS idx_gateway_operation_events_operation
                     ON gateway_operation_events(operation_id, event_id)"""
                 )
+                reservation_columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(daily_reservations)"
+                    ).fetchall()
+                }
+                if "reservation_status" not in reservation_columns:
+                    connection.execute(
+                        """ALTER TABLE daily_reservations
+                        ADD COLUMN reservation_status TEXT NOT NULL DEFAULT 'SETTLED'
+                        CHECK (reservation_status IN (
+                            'RESERVED', 'SETTLED', 'RELEASED', 'NOT_RESERVED'
+                        ))"""
+                    )
+                    # Historical FAILED rows remain charged: the old code had no proof contract.
+                    connection.execute(
+                        """UPDATE daily_reservations AS reservation
+                        SET reservation_status = CASE
+                            WHEN reservation.allowed = 0 THEN 'NOT_RESERVED'
+                            WHEN EXISTS (
+                                SELECT 1 FROM gateway_operations AS operation
+                                WHERE operation.policy_id = reservation.policy_id
+                                  AND reservation.request_id = 'gateway:' || operation.operation_id
+                                  AND operation.status IN ('APPROVED', 'EXECUTING', 'UNKNOWN')
+                            ) THEN 'RESERVED'
+                            ELSE 'SETTLED'
+                        END
+                        WHERE reservation.request_id LIKE 'gateway:%'"""
+                    )
+
                 connection.execute(
                     """INSERT INTO gateway_operation_events (
                         operation_id, previous_status, new_status, event_type,
@@ -310,6 +342,9 @@ class SQLitePolicyStore:
             "result": row["result"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "reservation_status": (
+                row["reservation_status"] if "reservation_status" in row.keys() else None
+            ),
         }
 
     @staticmethod
@@ -395,8 +430,12 @@ class SQLitePolicyStore:
                 return None
 
             previous = connection.execute(
-                """SELECT * FROM gateway_operations
-                WHERE idempotency_key = ?""",
+                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                FROM gateway_operations AS operations
+                LEFT JOIN daily_reservations AS reservations
+                  ON reservations.policy_id = operations.policy_id
+                 AND reservations.request_id = 'gateway:' || operations.operation_id
+                WHERE operations.idempotency_key = ?""",
                 (idempotency_key,),
             ).fetchone()
             if previous is not None:
@@ -425,7 +464,8 @@ class SQLitePolicyStore:
 
             usage = connection.execute(
                 """SELECT amount FROM daily_reservations
-                WHERE policy_id = ? AND utc_day = ? AND allowed = 1""",
+                WHERE policy_id = ? AND utc_day = ? AND allowed = 1
+                  AND reservation_status IN ('RESERVED', 'SETTLED')""",
                 (policy_id, utc_day),
             ).fetchall()
             with localcontext() as context:
@@ -437,8 +477,8 @@ class SQLitePolicyStore:
             decision = check_transaction(request, policy)
             connection.execute(
                 """INSERT INTO daily_reservations
-                (policy_id, request_id, utc_day, amount, recipient, allowed, reason_code, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (policy_id, request_id, utc_day, amount, recipient, allowed, reason_code, reason, reservation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     policy_id,
                     reservation_id,
@@ -448,6 +488,7 @@ class SQLitePolicyStore:
                     int(decision.allowed),
                     decision.reason_code.value,
                     decision.reason,
+                    "RESERVED" if decision.allowed else "NOT_RESERVED",
                 ),
             )
             status = "APPROVED" if decision.allowed else "DENIED"
@@ -470,7 +511,12 @@ class SQLitePolicyStore:
                 ),
             )
             row = connection.execute(
-                "SELECT * FROM gateway_operations WHERE operation_id = ?",
+                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                FROM gateway_operations AS operations
+                LEFT JOIN daily_reservations AS reservations
+                  ON reservations.policy_id = operations.policy_id
+                 AND reservations.request_id = 'gateway:' || operations.operation_id
+                WHERE operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
             self._insert_gateway_event(
@@ -545,34 +591,87 @@ class SQLitePolicyStore:
         operation_id: str,
         status: str,
         result: str | None = None,
+        *,
+        no_side_effect_confirmed: bool = False,
     ) -> bool:
-        """Persist an execution outcome; only EXECUTING operations can complete."""
+        """Persist an execution outcome and its budget effect atomically.
+
+        FAILED is accepted only from a trusted executor path that explicitly
+        confirms no side effect occurred. UNKNOWN deliberately keeps the
+        reservation active.
+        """
         if status not in {"SUCCEEDED", "FAILED", "UNKNOWN"}:
             raise ValueError("Invalid terminal gateway operation status.")
         if result is not None and (not isinstance(result, str) or len(result) > 1000):
             raise ValueError("Gateway operation result must be a string of at most 1000 characters.")
+        if type(no_side_effect_confirmed) is not bool:
+            raise ValueError("no_side_effect_confirmed must be a boolean.")
+        if status == "FAILED" and no_side_effect_confirmed is not True:
+            raise ValueError("FAILED requires confirmation that no side effect occurred.")
+        if status != "FAILED" and no_side_effect_confirmed:
+            raise ValueError("No-side-effect confirmation is valid only for FAILED.")
+
         connection = self._connect()
         try:
-            with connection:
-                timestamp = datetime.now(timezone.utc).isoformat()
-                cursor = connection.execute(
-                    """UPDATE gateway_operations
-                    SET status = ?, result = ?, updated_at = ?
-                    WHERE operation_id = ? AND status = 'EXECUTING'""",
-                    (status, result, timestamp, operation_id),
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                """SELECT policy_id, status, allowed
+                FROM gateway_operations WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            if operation is None or operation["status"] != "EXECUTING":
+                connection.commit()
+                return False
+
+            timestamp = datetime.now(timezone.utc).isoformat()
+            cursor = connection.execute(
+                """UPDATE gateway_operations
+                SET status = ?, result = ?, updated_at = ?
+                WHERE operation_id = ? AND status = 'EXECUTING'""",
+                (status, result, timestamp, operation_id),
+            )
+            if cursor.rowcount != 1:
+                connection.commit()
+                return False
+
+            safe_reason = (
+                "Executor completed successfully." if status == "SUCCEEDED"
+                else "Trusted executor confirmed that no side effect occurred." if status == "FAILED"
+                else "Execution outcome is uncertain."
+            )
+            self._insert_gateway_event(
+                connection, operation_id, "EXECUTING", status,
+                "EXECUTION_COMPLETED", "system", "gateway", safe_reason, timestamp,
+            )
+
+            if status in {"SUCCEEDED", "FAILED"}:
+                next_reservation_status = "SETTLED" if status == "SUCCEEDED" else "RELEASED"
+                reservation = connection.execute(
+                    """UPDATE daily_reservations
+                    SET reservation_status = ?
+                    WHERE policy_id = ? AND request_id = ?
+                      AND allowed = 1 AND reservation_status = 'RESERVED'""",
+                    (next_reservation_status, operation["policy_id"], f"gateway:{operation_id}"),
                 )
-                if cursor.rowcount == 1:
-                    safe_reason = (
-                        "Executor completed successfully." if status == "SUCCEEDED"
-                        else "Executor reported a failure." if status == "FAILED"
-                        else "Execution outcome is uncertain."
-                    )
-                    self._insert_gateway_event(
-                        connection, operation_id, "EXECUTING", status,
-                        "EXECUTION_COMPLETED", "system", "gateway",
-                        safe_reason, timestamp,
-                    )
-                return cursor.rowcount == 1
+                if reservation.rowcount != 1:
+                    raise RuntimeError("Gateway operation has no active budget reservation to settle or release.")
+                event_type = "RESERVATION_SETTLED" if status == "SUCCEEDED" else "RESERVATION_RELEASED"
+                event_reason = (
+                    "Approved budget reservation was committed after successful execution."
+                    if status == "SUCCEEDED"
+                    else "Budget reservation was released after the trusted executor confirmed no side effect."
+                )
+                self._insert_gateway_event(
+                    connection, operation_id, status, status, event_type,
+                    "system", "gateway", event_reason, timestamp,
+                )
+
+            connection.commit()
+            return True
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -584,8 +683,12 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             row = connection.execute(
-                """SELECT * FROM gateway_operations
-                WHERE policy_id = ? AND idempotency_key = ?""",
+                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                FROM gateway_operations AS operations
+                LEFT JOIN daily_reservations AS reservations
+                  ON reservations.policy_id = operations.policy_id
+                 AND reservations.request_id = 'gateway:' || operations.operation_id
+                WHERE operations.policy_id = ? AND operations.idempotency_key = ?""",
                 (policy_id, idempotency_key),
             ).fetchone()
         finally:
@@ -596,7 +699,12 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             row = connection.execute(
-                "SELECT * FROM gateway_operations WHERE operation_id = ?",
+                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                FROM gateway_operations AS operations
+                LEFT JOIN daily_reservations AS reservations
+                  ON reservations.policy_id = operations.policy_id
+                 AND reservations.request_id = 'gateway:' || operations.operation_id
+                WHERE operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
         finally:
@@ -722,7 +830,8 @@ class SQLitePolicyStore:
 
             usage = connection.execute(
                 """SELECT amount FROM daily_reservations
-                WHERE policy_id = ? AND utc_day = ? AND allowed = 1""",
+                WHERE policy_id = ? AND utc_day = ? AND allowed = 1
+                  AND reservation_status IN ('RESERVED', 'SETTLED')""",
                 (policy_id, utc_day),
             ).fetchall()
             # Aggregate reservations with the same exact precision used by
@@ -738,8 +847,8 @@ class SQLitePolicyStore:
             decision = check_transaction(request, policy)
             connection.execute(
                 """INSERT INTO daily_reservations
-                (policy_id, request_id, utc_day, amount, recipient, allowed, reason_code, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (policy_id, request_id, utc_day, amount, recipient, allowed, reason_code, reason, reservation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     policy_id,
                     request_id,
@@ -749,6 +858,7 @@ class SQLitePolicyStore:
                     int(decision.allowed),
                     decision.reason_code.value,
                     decision.reason,
+                    "SETTLED" if decision.allowed else "NOT_RESERVED",
                 ),
             )
             connection.commit()
