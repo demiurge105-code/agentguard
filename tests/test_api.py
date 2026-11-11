@@ -522,6 +522,7 @@ def test_bearer_authentication_is_declared_in_openapi(app):
         "/policies",
         "/policies/{policy_id}/rotate-agent-token",
         "/check-transaction",
+        "/gateway/operations",
     ):
         assert {"HTTPBearer": []} in schema["paths"][path]["post"]["security"]
 
