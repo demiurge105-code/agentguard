@@ -125,7 +125,7 @@ If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotatio
 
 Use `examples/demo_agent.py` as the canonical Gateway v1 demo. It creates a policy through the local FastAPI endpoint, opens the same SQLite database, then submits two immutable `ActionIntent` objects to `TrustedExecutionGateway`.
 
-The demo does **not** call `/check-transaction` and then decide for itself whether to execute. The gateway authenticates the agent token, evaluates and reserves budget, persists the operation, atomically claims execution, and invokes its own `PrintOnlyExecutor` only for an approved action.
+The demo does **not** call `/check-transaction` and then decide for itself whether to execute. The API server authenticates the agent token, evaluates and reserves budget, persists the operation, atomically claims execution, and invokes its own `PrintOnlyExecutor` only for an approved action. The agent process never opens the SQLite database or receives an executor reference.
 
 - The first proposal is within the per-transaction limit and should finish as `SUCCEEDED`.
 - The second proposal exceeds the per-transaction limit and should finish as `DENIED`; the executor is not called.
@@ -163,7 +163,7 @@ $env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
 python examples/demo_agent.py
 ```
 
-Both processes must use the same `AGENTGUARD_DB_PATH`. If unset, each uses `agentguard.db` in its current working directory, so run both from the repository root or set the same absolute path in both terminals. The demo accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+The API server uses `AGENTGUARD_DB_PATH` for SQLite; if unset, it uses `agentguard.db` in its current working directory. The demo does not access this file directly. It accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
 
 All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The gateway is an in-process application boundary, not a sandbox against malicious Python code running with the same process privileges. The existing `/check-transaction` API remains available for backward compatibility and is separate from the gateway execution endpoint.
 
