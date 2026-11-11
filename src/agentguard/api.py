@@ -363,7 +363,7 @@ def create_app(
                 "reason_code", "reason", "result", "created_at", "updated_at",
             )
         }
-        response["execution_status"] = execution_status or "NOT_QUEUED"
+        response["execution_status"] = operation["execution_status"] or "NOT_QUEUED"
         return response
 
     @application.get("/gateway/operations/{operation_id}/events")
