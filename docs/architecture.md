@@ -23,12 +23,15 @@ The canonical `examples/demo_agent.py` exercises the authenticated HTTP Gateway 
 2. Each proposal is converted into the core immutable `ActionIntent`.
 3. The demo submits the policy ID, exact decimal amount, recipient, agent token, and a unique `Idempotency-Key` to `POST /gateway/operations`.
 4. The API loads the policy's stored chain context. It does not accept caller-supplied chain IDs, policy limits, daily-spent values, or executor parameters.
-5. The API authenticates the token to obtain policy context, then the gateway reauthenticates atomically when creating/reserving the operation and again when claiming `APPROVED -> EXECUTING`. A token revoked between those stages cannot reach the executor.
-6. The store binds the globally unique idempotency key to the policy and canonical intent, evaluates policy, reserves budget, and persists the operation in one `BEGIN IMMEDIATE` transaction.
-7. Only the request that wins the atomic execution claim may invoke the server-owned `PrintOnlyExecutor`. The executor receives the same immutable `ActionIntent` and stable operation ID.
-8. The gateway persists `SUCCEEDED`, `FAILED`, or `UNKNOWN` from its trusted executor outcome contract. Executor exceptions and arbitrary executor return data are not stored. An ambiguous operation is never automatically executed again.
+5. The API authenticates the token to obtain policy context, then the store reauthenticates atomically while binding the idempotency key, evaluating policy, reserving budget, creating the operation, and enqueueing its job.
+6. The API returns the persisted operation state. An allowed operation remains `APPROVED` while its separate execution-job state is `QUEUED`; the HTTP request never invokes an executor.
+7. A separate worker atomically leases a `QUEUED` job (or an expired pre-dispatch `LEASED` job), incrementing its fencing token. Two workers cannot own the same current lease.
+8. Immediately before invoking the executor, the worker atomically verifies its worker ID, fencing token, and unexpired lease, then moves the job to `DISPATCH_STARTED` and the operation to `EXECUTING`. This is the no-replay boundary.
+9. The worker persists `SUCCEEDED`, `FAILED`, or `UNKNOWN` only if its fencing token is still current and the operation remains `EXECUTING`. Executor exceptions and arbitrary return data are not stored.
 
-The operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. A trusted executor may return a typed `ExecutionOutcome`; `FAILED` is accepted only when its contract confirms no side effect occurred. If the process crashes after `EXECUTING` is committed, the operation remains unresolved until manually reconciled; retries do not invoke the executor again.
+Operation states remain `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. Job states are `QUEUED`, `LEASED`, `DISPATCH_STARTED`, `COMPLETED`, and `UNKNOWN`. A trusted executor may return a typed `ExecutionOutcome`; `FAILED` is accepted only when its contract confirms no side effect occurred.
+
+An expired `LEASED` job can be reclaimed because the worker has not crossed the dispatch boundary; its fencing token increments, so the previous worker cannot start. Once `DISPATCH_STARTED` is durable, the job is never automatically re-leased. A crash between persisting this state and actually calling the executor can therefore produce zero execution attempts. A crash after an external side effect but before result persistence leaves an ambiguous operation; stale recovery moves it to `UNKNOWN`, retains the reservation, and fences late worker completion.
 
 Idempotency keys are globally unique within the SQLite database. Reuse with a different policy or canonical intent conflicts. Gateway reservations use a random operation-scoped reservation ID rather than the caller-provided key, avoiding collisions with legacy `/check-transaction` request IDs.
 
@@ -66,8 +69,11 @@ Public methods:
 - `get_policy(policy_id) -> Policy | None`
 - `evaluate_and_reserve(policy_id, amount, recipient, request_id) -> Decision | None`
 - `begin_gateway_operation(intent, agent_token, idempotency_key) -> operation | None`
-- `claim_gateway_operation(operation_id, agent_token) -> bool | None`
-- `complete_gateway_operation(operation_id, status, result=None, no_side_effect_confirmed=False) -> bool`
+- `claim_execution_job(worker_id, lease_seconds=30) -> job | None`
+- `start_execution_job(operation_id, worker_id, fencing_token) -> bool`
+- `complete_execution_job(operation_id, worker_id, fencing_token, status, result=None) -> bool`
+- `get_gateway_execution_status(operation_id) -> str | None`
+- `claim_gateway_operation(...) -> bool | None` and `complete_gateway_operation(...)` — retained for the legacy in-process helper, not used by the HTTP API.
 - `get_gateway_operation(policy_id, idempotency_key) -> operation | None`
 - `get_gateway_operation_by_id(operation_id) -> operation | None`
 - `list_gateway_operation_events(operation_id) -> events | None`
@@ -75,15 +81,29 @@ Public methods:
 
 Policy limits and transaction amounts are stored as decimal strings. Recipient allowlists are stored as JSON. The nullable `policies.chain_id` column binds a policy to its chain; older databases are migrated with `chain_id = NULL` and therefore remain in legacy mode. The `policies.agent_token_hash` column stores only a SHA-256 hexadecimal digest; raw agent tokens are never written to SQLite. The `daily_reservations` table records each request's UTC date, amount, recipient, decision, and reservation lifecycle state (`RESERVED`, `SETTLED`, `RELEASED`, or `NOT_RESERVED`).
 
-### Trusted Execution Gateway
+### Durable execution jobs and worker
 
-Implemented in `agentguard.gateway.TrustedExecutionGateway`.
+The API's `POST /gateway/operations` path is enqueue-only. The operation row, daily-budget reservation, audit event, and `gateway_execution_jobs` outbox row are created in the same SQLite `BEGIN IMMEDIATE` transaction. An allowed API response is `status: APPROVED` and `execution_status: QUEUED`; denial creates no job.
 
-The gateway owns a callable executor reference and accepts only a validated `ActionIntent`. The store persists an operation row with a globally unique idempotency key and exact canonical intent. Authentication, policy evaluation, budget reservation, and initial operation creation share one SQLite write transaction. A second atomic transaction revalidates the current token and claims the operation for execution.
+Implemented in `agentguard.worker.ExecutionWorker` and `agentguard.storage.SQLitePolicyStore`.
 
-Only the request that changes `APPROVED` to `EXECUTING` may call the executor. Retries return the stored state. Concurrent retries cannot claim the same operation twice. The gateway never automatically re-executes an operation left in `EXECUTING` after a crash. Operators can explicitly mark such an operation `UNKNOWN`, but this does not authorize a retry.
+The worker uses the following job lifecycle:
 
-The current `PrintOnlyExecutor` only prints a simulated action and uses the backward-compatible `None` return to indicate success. A future executor can return `ExecutionOutcome`; it must return `FAILED` only when its own verification contract establishes that no side effect occurred. Arbitrary executor return values and exception messages are not stored; ambiguous outcomes are recorded as `UNKNOWN`.
+- `QUEUED`: durably waiting for a worker.
+- `LEASED`: one worker owns a bounded pre-dispatch lease.
+- `DISPATCH_STARTED`: the worker has crossed the no-automatic-replay boundary.
+- `COMPLETED`: a terminal `SUCCEEDED` or trusted `FAILED` result was persisted.
+- `UNKNOWN`: execution may have started, but its outcome cannot be safely established.
+
+Claiming a job runs under `BEGIN IMMEDIATE`. A lease is reclaimable only while the job is still `LEASED` and its expiry has passed. Each claim increments a monotonically increasing fencing token. Before calling the executor, the worker must atomically prove that its worker ID and fencing token still match and that its lease has not expired. That transition changes the operation from `APPROVED` to `EXECUTING` and the job to `DISPATCH_STARTED`.
+
+After dispatch starts, a job is never automatically reclaimed. If the process crashes before it calls the executor, the operation may never execute; this is an intentional safety trade-off. If a side effect occurs but its result is not persisted, recovery changes the operation and job to `UNKNOWN`, keeps the reservation, and prevents a late worker from persisting a result. A stale worker cannot complete after its job has been fenced by recovery.
+
+Run the worker with `agentguard-worker`; use `agentguard-worker --once` to process at most one queued job. The API and worker must point to the same SQLite file via `AGENTGUARD_DB_PATH`.
+
+The print-only executor only prints a simulation. A future executor can return `ExecutionOutcome`; it must return `FAILED` only when its own verification contract establishes that no side effect occurred. Arbitrary executor return values and exception messages are not stored; ambiguous outcomes are recorded as `UNKNOWN`.
+
+The older in-process `TrustedExecutionGateway` helper remains available for direct internal use and its existing tests, but the HTTP API no longer invokes it. Do not wire an external executor into that in-process path.
 
 Every operation creation and subsequent status transition is accompanied by an append-only `gateway_operation_events` row in the same SQLite transaction. Events include transition, actor type/identifier, bounded reason, and timestamp, but never credentials or arbitrary executor data. Existing operations are migrated with a `LEGACY_IMPORT` event that explicitly states earlier transitions are unavailable.
 
