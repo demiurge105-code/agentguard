@@ -506,3 +506,20 @@ async def test_check_transaction_uses_atomic_storage_authentication(app, admin_t
 
     assert response.status_code == 200
     assert response.json()["allowed"] is True
+
+
+
+def test_bearer_authentication_is_declared_in_openapi(app):
+    schema = app.openapi()
+
+    assert schema["components"]["securitySchemes"]["HTTPBearer"] == {
+        "type": "http",
+        "scheme": "bearer",
+    }
+
+    for path in (
+        "/policies",
+        "/policies/{policy_id}/rotate-agent-token",
+        "/check-transaction",
+    ):
+        assert {"HTTPBearer": []} in schema["paths"][path]["post"]["security"]
