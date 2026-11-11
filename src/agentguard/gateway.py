@@ -37,7 +37,7 @@ class OperationResult:
     updated_at: str
 
 
-Executor = Callable[[ActionIntent, str], str | None]
+Executor = Callable[[ActionIntent, str], None]
 
 
 def _result_from_record(record: dict[str, object]) -> OperationResult:
@@ -117,23 +117,21 @@ class TrustedExecutionGateway:
             stored = self._store.complete_gateway_operation(
                 operation.operation_id,
                 OperationStatus.UNKNOWN.value,
-                f"Executor raised {type(error).__name__}.",
+                "Executor raised an exception; outcome may be unknown.",
             )
             if not stored:
                 raise RuntimeError(
                     "Executor outcome is uncertain and could not be persisted."
                 ) from error
         else:
-            if execution_result is not None and not isinstance(execution_result, str):
-                execution_result = None
+            if execution_result is not None:
                 terminal_status = OperationStatus.UNKNOWN
-                stored_result = "Executor returned an unsupported result type."
-            elif isinstance(execution_result, str) and len(execution_result) > 1000:
-                terminal_status = OperationStatus.UNKNOWN
-                stored_result = "Executor result exceeded the storage limit."
+                stored_result = "Executor returned unsupported data; outcome may be unknown."
             else:
                 terminal_status = OperationStatus.SUCCEEDED
-                stored_result = execution_result
+                # Persist only a fixed status message, never arbitrary executor
+                # output that could accidentally contain credentials or secrets.
+                stored_result = "Execution completed."
 
             stored = self._store.complete_gateway_operation(
                 operation.operation_id,
@@ -157,9 +155,9 @@ class TrustedExecutionGateway:
 class PrintOnlyExecutor:
     """Minimal executor that prints a simulation and performs no external action."""
 
-    def __call__(self, intent: ActionIntent, operation_id: str) -> str:
+    def __call__(self, intent: ActionIntent, operation_id: str) -> None:
         print(
             f"Simulated operation {operation_id}: "
             f"{intent.amount} units to {intent.recipient}."
         )
-        return "Simulation completed; no transaction was sent."
+        return None
