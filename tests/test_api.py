@@ -614,7 +614,7 @@ async def submit_gateway(
 
 
 @pytest.mark.anyio
-async def test_gateway_endpoint_executes_allowed_action_once(app, admin_token, monkeypatch):
+async def test_gateway_endpoint_queues_allowed_action_without_inline_execution(app, admin_token, monkeypatch):
     calls = []
 
     class CountingExecutor:
@@ -631,11 +631,42 @@ async def test_gateway_endpoint_executes_allowed_action_once(app, admin_token, m
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "SUCCEEDED"
+    assert body["status"] == "APPROVED"
+    assert body["execution_status"] == "QUEUED"
     assert body["allowed"] is True
     assert body["operation_id"]
-    assert len(calls) == 1
-    assert calls[0][0].policy_id == created["policy_id"]
+    assert calls == []
+    assert app.state.store.get_gateway_execution_status(body["operation_id"]) == "QUEUED"
+
+
+@pytest.mark.anyio
+async def test_api_enqueue_then_separate_worker_completes_operation(app, admin_token):
+    from agentguard.worker import ExecutionWorker
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        submitted = await submit_gateway(
+            client, created["policy_id"], "api-worker-integration", created["agent_token"]
+        )
+        operation_id = submitted.json()["operation_id"]
+        assert submitted.json()["status"] == "APPROVED"
+        assert submitted.json()["execution_status"] == "QUEUED"
+
+        worker = ExecutionWorker(
+            app.state.store,
+            lambda intent, operation_id: None,
+            "integration-worker",
+        )
+        assert worker.run_once() == operation_id
+        inspected = await client.get(
+            f"/gateway/operations/{operation_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    assert inspected.status_code == 200
+    assert inspected.json()["status"] == "SUCCEEDED"
+    assert inspected.json()["execution_status"] == "COMPLETED"
+    assert inspected.json()["reservation_status"] == "SETTLED"
 
 
 @pytest.mark.anyio
@@ -703,7 +734,8 @@ async def test_gateway_endpoint_retry_is_idempotent_and_conflict_returns_409(
     assert first.status_code == retry.status_code == 200
     assert first.json() == retry.json()
     assert conflict.status_code == 409
-    assert len(calls) == 1
+    assert calls == []
+    assert first.json()["execution_status"] == "QUEUED"
 
 
 @pytest.mark.anyio
@@ -846,12 +878,13 @@ async def test_gateway_endpoint_uses_stored_evm_chain_context(app, admin_token):
         )
 
     assert valid.status_code == 200
-    assert valid.json()["status"] == "SUCCEEDED"
+    assert valid.json()["status"] == "APPROVED"
+    assert valid.json()["execution_status"] == "QUEUED"
     assert invalid.status_code == 422
 
 
 @pytest.mark.anyio
-async def test_gateway_endpoint_revalidates_token_at_execution_claim(
+async def test_gateway_endpoint_revalidates_token_inside_atomic_enqueue(
     app, admin_token, monkeypatch
 ):
     calls = []
@@ -865,16 +898,16 @@ async def test_gateway_endpoint_revalidates_token_at_execution_claim(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         created = (await create_policy(client, admin_token)).json()
         store = app.state.store
-        original_claim = store.claim_gateway_operation
+        original_begin = store.begin_gateway_operation
 
-        def rotate_then_claim(operation_id, token):
+        def rotate_then_enqueue(intent, token, idempotency_key):
             store.rotate_agent_token(
                 created["policy_id"],
                 hashlib.sha256(new_token.encode("utf-8")).hexdigest(),
             )
-            return original_claim(operation_id, token)
+            return original_begin(intent, token, idempotency_key)
 
-        monkeypatch.setattr(store, "claim_gateway_operation", rotate_then_claim)
+        monkeypatch.setattr(store, "begin_gateway_operation", rotate_then_enqueue)
         response = await submit_gateway(
             client,
             created["policy_id"],
@@ -887,7 +920,7 @@ async def test_gateway_endpoint_revalidates_token_at_execution_claim(
 
 
 @pytest.mark.anyio
-async def test_gateway_endpoint_storage_failure_before_claim_fails_closed(
+async def test_gateway_endpoint_storage_failure_during_enqueue_fails_closed(
     app, admin_token, monkeypatch
 ):
     calls = []
@@ -901,10 +934,10 @@ async def test_gateway_endpoint_storage_failure_before_claim_fails_closed(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         created = (await create_policy(client, admin_token)).json()
 
-        def fail_claim(operation_id, agent_token):
+        def fail_enqueue(intent, agent_token, idempotency_key):
             raise sqlite3.OperationalError("database unavailable")
 
-        monkeypatch.setattr(app.state.store, "claim_gateway_operation", fail_claim)
+        monkeypatch.setattr(app.state.store, "begin_gateway_operation", fail_enqueue)
         response = await submit_gateway(
             client,
             created["policy_id"],
@@ -917,11 +950,11 @@ async def test_gateway_endpoint_storage_failure_before_claim_fails_closed(
     operation = app.state.store.get_gateway_operation(
         created["policy_id"], "gateway-storage-failure"
     )
-    assert operation["status"] == "APPROVED"
+    assert operation is None
 
 
 @pytest.mark.anyio
-async def test_gateway_endpoint_concurrent_retries_execute_once(app, admin_token, monkeypatch):
+async def test_gateway_endpoint_concurrent_retries_enqueue_once(app, admin_token, monkeypatch):
     from threading import Lock
     import time
 
@@ -950,11 +983,12 @@ async def test_gateway_endpoint_concurrent_retries_execute_once(app, admin_token
         )
 
     assert all(response.status_code == 200 for response in responses)
-    assert len(calls) == 1
+    assert calls == []
     assert len({response.json()["operation_id"] for response in responses}) == 1
+    assert all(response.json()["execution_status"] == "QUEUED" for response in responses)
     assert app.state.store.get_gateway_operation(
         created["policy_id"], "gateway-concurrent"
-    )["status"] == "SUCCEEDED"
+    )["status"] == "APPROVED"
 
 
 @pytest.mark.anyio
@@ -972,7 +1006,8 @@ async def test_gateway_audit_endpoints_require_owner(app, admin_token):
         events = await client.get(f"/gateway/operations/{operation_id}/events", headers=owner_headers)
     assert [denied.status_code, denied_events.status_code, denied_reconcile.status_code] == [401, 401, 401]
     assert read.status_code == events.status_code == 200
-    assert read.json()["reservation_status"] == "SETTLED"
+    assert read.json()["reservation_status"] == "RESERVED"
+    assert read.json()["execution_status"] == "QUEUED"
     assert events.json()["events"][0]["event_type"] == "OPERATION_CREATED"
     assert "agent_token" not in read.json()
 

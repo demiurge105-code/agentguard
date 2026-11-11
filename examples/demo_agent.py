@@ -126,23 +126,23 @@ def run_demo(base_url: str, admin_token: str) -> None:
         )
         allowed = result.get("allowed") is True
         status_value = result.get("status")
-        if not isinstance(status_value, str):
-            raise RuntimeError("Gateway response is missing its operation status.")
+        execution_status = result.get("execution_status")
+        if not isinstance(status_value, str) or not isinstance(execution_status, str):
+            raise RuntimeError("Gateway response is missing its operation or execution status.")
 
         label = "ALLOW" if allowed else "DENY"
         print(f"  AgentGuard: {label} ({status_value})")
         print(f"  Reason: {result.get('reason', 'No reason returned')}")
         print(f"  Operation ID: {result.get('operation_id', 'Unavailable')}")
 
-        if status_value == "SUCCEEDED":
-            print("  Gateway: simulated execution completed.")
+        if status_value == "APPROVED" and execution_status == "QUEUED":
+            print("  Gateway: durably queued; run the separate worker to execute the simulation.")
         elif status_value == "DENIED":
-            print("  Gateway: executor was not called.")
+            print("  Gateway: executor was not queued or called.")
+        elif status_value in {"SUCCEEDED", "FAILED", "UNKNOWN"}:
+            print(f"  Gateway: operation is already in terminal state {status_value}.")
         else:
-            print(
-                "  Gateway: operation is unresolved; it will not be "
-                "automatically executed again."
-            )
+            print(f"  Gateway: execution state is {execution_status}; no automatic replay is performed.")
         print()
 
     print("Demo complete. No wallet was connected and no transaction was sent.")

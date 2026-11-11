@@ -275,8 +275,8 @@ def create_app(
 
         try:
             # This authenticated lookup supplies the policy's immutable chain
-            # context. The gateway reauthenticates during reservation and claim,
-            # so token rotation between these steps still fails closed.
+            # context. The store reauthenticates atomically when it reserves the
+            # budget and enqueues the job; this HTTP request never invokes an executor.
             policy = get_store().get_policy_authenticated(data.policy_id, agent_token)
             if policy is None:
                 raise HTTPException(
@@ -305,10 +305,17 @@ def create_app(
                 data.recipient,
                 chain_id=policy.chain_id,
             )
-            result = TrustedExecutionGateway(
-                get_store(),
-                PrintOnlyExecutor(),
-            ).submit(intent, agent_token, idempotency_key)
+            operation = get_store().begin_gateway_operation(
+                intent,
+                agent_token,
+                idempotency_key,
+            )
+            if operation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or missing agent token.",
+                )
+            execution_status = operation["execution_status"]
         except GatewayAuthenticationError as error:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -325,15 +332,16 @@ def create_app(
             ) from error
 
         return {
-            "operation_id": result.operation_id,
-            "policy_id": result.policy_id,
-            "status": result.status.value,
-            "allowed": result.allowed,
-            "reason_code": result.reason_code,
-            "reason": result.reason,
-            "result": result.result,
-            "created_at": result.created_at,
-            "updated_at": result.updated_at,
+            "operation_id": operation["operation_id"],
+            "policy_id": operation["policy_id"],
+            "status": operation["status"],
+            "execution_status": execution_status or "NOT_QUEUED",
+            "allowed": operation["allowed"],
+            "reason_code": operation["reason_code"],
+            "reason": operation["reason"],
+            "result": operation["result"],
+            "created_at": operation["created_at"],
+            "updated_at": operation["updated_at"],
         }
 
     @application.get("/gateway/operations/{operation_id}")
@@ -348,13 +356,15 @@ def create_app(
             raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
         if operation is None:
             raise HTTPException(status_code=404, detail="Gateway operation not found.")
-        return {
+        response = {
             key: operation[key]
             for key in (
                 "operation_id", "policy_id", "status", "reservation_status", "allowed",
                 "reason_code", "reason", "result", "created_at", "updated_at",
             )
         }
+        response["execution_status"] = operation["execution_status"] or "NOT_QUEUED"
+        return response
 
     @application.get("/gateway/operations/{operation_id}/events")
     def get_gateway_operation_events(

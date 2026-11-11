@@ -129,10 +129,10 @@ If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotatio
 
 Use `examples/demo_agent.py` as the canonical Gateway v1 demo. It creates a policy through the local FastAPI endpoint, builds two immutable `ActionIntent` objects, then submits them over HTTP to `/gateway/operations`.
 
-The demo does **not** call `/check-transaction` and then decide for itself whether to execute. The API server authenticates the agent token, evaluates and reserves budget, persists the operation, atomically claims execution, and invokes its own `PrintOnlyExecutor` only for an approved action. The agent process never opens the SQLite database or receives an executor reference.
+The demo does **not** call `/check-transaction` and then decide for itself whether to execute. The API authenticates the agent token, evaluates policy, reserves budget, and atomically persists an execution job. It returns without invoking an executor. A separate worker process claims the job and invokes the print-only executor. The agent process never opens the SQLite database or receives an executor reference.
 
-- The first proposal is within the per-transaction limit and should finish as `SUCCEEDED`.
-- The second proposal exceeds the per-transaction limit and should finish as `DENIED`; the executor is not called.
+- The first proposal is within the per-transaction limit and should be returned as `APPROVED` with `execution_status: QUEUED`.
+- The second proposal exceeds the per-transaction limit and should be returned as `DENIED`; no execution job is created.
 - Operation IDs and statuses are printed. The agent token is kept in memory and never printed.
 
 The demo is deterministic; no LLM API key or wallet is required.
@@ -167,9 +167,21 @@ $env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
 python examples/demo_agent.py
 ```
 
-The API server uses `AGENTGUARD_DB_PATH` for SQLite; if unset, it uses `agentguard.db` in its current working directory. The demo does not access this file directly. It accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+The API server and worker must use the same `AGENTGUARD_DB_PATH`. The API stores an approved execution job in SQLite and returns `APPROVED` with `execution_status: QUEUED`; it does not call the executor. Start a separate worker process from the repository root:
 
-All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The gateway is an in-process application boundary, not a sandbox against malicious Python code running with the same process privileges. The existing `/check-transaction` API remains available for backward compatibility and is separate from the gateway execution endpoint.
+```bash
+agentguard-worker
+```
+
+Or run one polling cycle:
+
+```bash
+agentguard-worker --once
+```
+
+The worker uses the same database path, claims jobs with a bounded lease, and prints simulated execution results. The demo itself only submits proposals; run the worker in a second terminal to process approved jobs. The demo accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+
+All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The worker is a separate process, but this is not a hardened sandbox or a distributed execution service. The existing `/check-transaction` API remains available for backward compatibility and is separate from the gateway execution endpoint.
 
 ### Create a policy
 
@@ -229,7 +241,7 @@ The response contains `allowed`, `reason_code`, and `reason`. Missing, invalid, 
 
 ### Submit an action through the Gateway
 
-`POST /gateway/operations` sends a proposed action through the in-process Trusted Execution Gateway. Unlike `/check-transaction`, this endpoint owns the print-only executor and returns a persisted operation state.
+`POST /gateway/operations` evaluates and durably enqueues an approved action. Unlike `/check-transaction`, it creates a gateway operation and a separate execution job, but it never calls an executor inside the API process.
 
 ```http
 POST /gateway/operations
@@ -244,11 +256,11 @@ Content-Type: application/json
 }
 ```
 
-The caller must provide a globally unique `Idempotency-Key`. Repeating the same key with the same policy and canonical action returns the stored operation without invoking the executor again. Reusing it with another policy or action returns HTTP 409.
+The caller must provide a globally unique `Idempotency-Key`. Repeating the same key with the same policy and canonical action returns the stored operation and job state without creating a second job. Reusing it with another policy or action returns HTTP 409.
 
-The response includes `operation_id`, `status`, `allowed`, `reason_code`, `reason`, and timestamps. A policy denial is returned as HTTP 200 with status `DENIED`; invalid or missing credentials return HTTP 401 without revealing whether the policy exists. Invalid payloads return HTTP 422.
+The response includes `operation_id`, operation `status`, `execution_status`, `allowed`, `reason_code`, `reason`, and timestamps. An allowed action is initially returned as `APPROVED` / `QUEUED`; a policy denial is returned as HTTP 200 with status `DENIED` / `NOT_QUEUED`. Invalid or missing credentials return HTTP 401 without revealing whether the policy exists. Invalid payloads return HTTP 422.
 
-The endpoint loads the chain identifier from the stored policy. The request cannot override `chain_id`, limits, daily spending, or executor parameters. Monetary amounts must be decimal strings. The endpoint uses `PrintOnlyExecutor`: `SUCCEEDED` means the simulation completed, not that a blockchain transaction was sent.
+The endpoint loads the chain identifier from the stored policy. The request cannot override `chain_id`, limits, daily spending, or executor parameters. Monetary amounts must be decimal strings. Run `agentguard-worker` separately to process queued jobs. The print-only executor's `SUCCEEDED` means the simulation completed, not that a blockchain transaction was sent.
 
 The gateway currently requires canonical UUID policy IDs generated by the current `/policies` endpoint. Older migrated policies with non-UUID IDs remain available through `/check-transaction`, but cannot use the gateway endpoint without a separate migration.
 
@@ -316,9 +328,9 @@ The current implementation consists of:
 - **Policy and request models** — validate policy limits, transaction amounts, and recipient identifiers.
 - **Chain adapters** — validate EVM CAIP-2 chain identifiers and normalize EVM addresses; other chain namespaces are not implemented yet.
 - **Policy engine** — evaluates a request and returns a deterministic decision.
-- **SQLite policy store** — persists policies, agent-token hashes, daily reservations, and gateway operation states separately from the policy engine.
-- **Trusted Execution Gateway** — authenticates and reserves atomically, binds idempotency keys to canonical intents, and owns the print-only executor exposed through `/gateway/operations`.
-- **FastAPI interface** — exposes owner-authenticated policy management, the backward-compatible `/check-transaction` endpoint, and the authenticated `/gateway/operations` execution endpoint.
+- **SQLite policy store** — persists policies, agent-token hashes, daily reservations, gateway operations, and a durable execution-job outbox.
+- **Execution worker** — claims queued jobs with expiring pre-dispatch leases and monotonically increasing fencing tokens; only a current worker can cross the dispatch boundary or persist its result.
+- **FastAPI interface** — exposes owner-authenticated policy management, the backward-compatible `/check-transaction` endpoint, and an enqueue-only `/gateway/operations` endpoint.
 - **Tests and examples** — demonstrate and verify the simulation behaviour.
 
 See [docs/architecture.md](docs/architecture.md) for more detail.
@@ -327,10 +339,9 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 
 Planned areas of work include:
 
-1. A dedicated gateway HTTP integration so remote agents can submit operations without accessing the SQLite store directly.
-2. Stronger audit integrity beyond the application-level append-only event history.
-3. External developer feedback and independent security review.
-4. Process isolation and further research before any wallet or testnet execution integration.
+1. Stronger audit integrity beyond the application-level append-only event history.
+2. External developer feedback and independent security review.
+3. Hardening the worker boundary and operational recovery before considering any external executor integration.
 
 The roadmap may change as the project is tested with developers and potential users.
 

@@ -147,7 +147,8 @@ def test_run_demo_submits_both_proposals_through_gateway_endpoint(monkeypatch, c
         index = len(calls)
         return {
             "operation_id": f"operation-{index}",
-            "status": "SUCCEEDED" if index == 1 else "DENIED",
+            "status": "APPROVED" if index == 1 else "DENIED",
+            "execution_status": "QUEUED" if index == 1 else "NOT_QUEUED",
             "allowed": index == 1,
             "reason": "test decision",
         }
@@ -157,7 +158,8 @@ def test_run_demo_submits_both_proposals_through_gateway_endpoint(monkeypatch, c
     run_demo("http://127.0.0.1:8000", "admin-secret-token")
 
     output = capsys.readouterr().out
-    assert "SUCCEEDED" in output
+    assert "APPROVED" in output
+    assert "durably queued" in output
     assert "DENIED" in output
     assert len(calls) == 2
     assert calls[0][0] == {
