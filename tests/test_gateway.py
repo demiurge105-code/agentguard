@@ -145,6 +145,30 @@ def test_invalid_token_does_not_reserve_or_execute(tmp_path):
     assert reservations == 0
 
 
+def test_token_revoked_between_reservation_and_claim_blocks_execution(tmp_path):
+    store, policy_id, old_token = make_store(tmp_path)
+    intent = make_intent(policy_id)
+    record = store.begin_gateway_operation(intent, old_token, "revoke-before-claim")
+
+    new_token = "new-token-before-claim"
+    store.rotate_agent_token(
+        policy_id,
+        hashlib.sha256(new_token.encode("utf-8")).hexdigest(),
+    )
+
+    assert store.claim_gateway_operation(record["operation_id"], old_token) is None
+    assert store.get_gateway_operation(policy_id, "revoke-before-claim")["status"] == "APPROVED"
+
+    calls = []
+    gateway = TrustedExecutionGateway(
+        store, lambda action, operation_id: calls.append(operation_id) or None
+    )
+    result = gateway.submit(intent, new_token, "revoke-before-claim")
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert len(calls) == 1
+
+
 def test_revoked_token_cannot_replay_existing_operation(tmp_path):
     store, policy_id, old_token = make_store(tmp_path)
     calls = []
@@ -170,7 +194,7 @@ def test_failed_execution_claim_never_invokes_executor(tmp_path, monkeypatch):
     store, policy_id, token = make_store(tmp_path)
     calls = []
 
-    def fail_claim(operation_id):
+    def fail_claim(operation_id, agent_token):
         raise OSError("database unavailable")
 
     monkeypatch.setattr(store, "claim_gateway_operation", fail_claim)
@@ -278,7 +302,7 @@ def test_crash_after_durable_claim_never_triggers_automatic_retry(tmp_path):
     intent = make_intent(policy_id)
     record = store.begin_gateway_operation(intent, token, "crash-after-claim")
     assert record["status"] == "APPROVED"
-    assert store.claim_gateway_operation(record["operation_id"]) is True
+    assert store.claim_gateway_operation(record["operation_id"], token) is True
 
     calls = []
     gateway = TrustedExecutionGateway(
