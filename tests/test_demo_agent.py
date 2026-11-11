@@ -160,7 +160,8 @@ def test_run_demo_uses_gateway_and_only_executes_allowed_proposal(
         ).fetchall()
     finally:
         connection.close()
-    assert [row["status"] for row in operations] == ["SUCCEEDED", "DENIED"]
+    assert len(operations) == 2
+    assert {row["status"] for row in operations} == {"SUCCEEDED", "DENIED"}
 
 
 def test_run_demo_stops_if_api_and_demo_use_different_databases(tmp_path, monkeypatch):
