@@ -887,6 +887,40 @@ async def test_gateway_endpoint_revalidates_token_at_execution_claim(
 
 
 @pytest.mark.anyio
+async def test_gateway_endpoint_storage_failure_before_claim_fails_closed(
+    app, admin_token, monkeypatch
+):
+    calls = []
+
+    class CountingExecutor:
+        def __call__(self, intent, operation_id):
+            calls.append(operation_id)
+
+    monkeypatch.setattr(api_module, "PrintOnlyExecutor", CountingExecutor)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+
+        def fail_claim(operation_id, agent_token):
+            raise sqlite3.OperationalError("database unavailable")
+
+        monkeypatch.setattr(app.state.store, "claim_gateway_operation", fail_claim)
+        response = await submit_gateway(
+            client,
+            created["policy_id"],
+            "gateway-storage-failure",
+            created["agent_token"],
+        )
+
+    assert response.status_code == 503
+    assert calls == []
+    operation = app.state.store.get_gateway_operation(
+        created["policy_id"], "gateway-storage-failure"
+    )
+    assert operation["status"] == "APPROVED"
+
+
+@pytest.mark.anyio
 async def test_gateway_endpoint_concurrent_retries_execute_once(app, admin_token, monkeypatch):
     from threading import Lock
     import time
