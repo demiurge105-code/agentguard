@@ -132,6 +132,24 @@ class SQLitePolicyStore:
                     """CREATE INDEX IF NOT EXISTS idx_gateway_operation_events_operation
                     ON gateway_operation_events(operation_id, event_id)"""
                 )
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS gateway_execution_jobs (
+                        operation_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL CHECK (status IN (
+                            'QUEUED', 'LEASED', 'DISPATCH_STARTED', 'COMPLETED', 'UNKNOWN'
+                        )),
+                        fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+                        worker_id TEXT,
+                        lease_expires_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY (operation_id) REFERENCES gateway_operations(operation_id)
+                    )"""
+                )
+                connection.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_gateway_execution_jobs_claim
+                    ON gateway_execution_jobs(status, lease_expires_at, created_at)"""
+                )
                 reservation_columns = {
                     row["name"]
                     for row in connection.execute(
@@ -510,6 +528,14 @@ class SQLitePolicyStore:
                     timestamp,
                 ),
             )
+            if decision.allowed:
+                connection.execute(
+                    """INSERT INTO gateway_execution_jobs (
+                        operation_id, status, fencing_token, worker_id,
+                        lease_expires_at, created_at, updated_at
+                    ) VALUES (?, 'QUEUED', 0, NULL, NULL, ?, ?)""",
+                    (operation_id, timestamp, timestamp),
+                )
             row = connection.execute(
                 """SELECT operations.*, reservations.reservation_status AS reservation_status
                 FROM gateway_operations AS operations
@@ -533,6 +559,282 @@ class SQLitePolicyStore:
             raise
         finally:
             connection.close()
+
+
+    def claim_execution_job(
+        self,
+        worker_id: str,
+        *,
+        lease_seconds: int = 30,
+        now: datetime | None = None,
+    ) -> dict[str, object] | None:
+        """Lease one queued job; expired pre-dispatch leases may be reclaimed."""
+        if not isinstance(worker_id, str) or not worker_id.strip() or len(worker_id) > 100:
+            raise ValueError("worker_id must contain 1-100 non-whitespace characters.")
+        if type(lease_seconds) is not int or not 5 <= lease_seconds <= 300:
+            raise ValueError("lease_seconds must be an integer between 5 and 300.")
+        reference_time = now or datetime.now(timezone.utc)
+        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+            raise ValueError("now must be timezone-aware.")
+        timestamp_dt = reference_time.astimezone(timezone.utc)
+        timestamp = timestamp_dt.isoformat()
+        lease_expires_at = (timestamp_dt + timedelta(seconds=lease_seconds)).isoformat()
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT jobs.operation_id, jobs.fencing_token,
+                          operations.canonical_intent, operations.policy_id,
+                          operations.status AS operation_status
+                FROM gateway_execution_jobs AS jobs
+                JOIN gateway_operations AS operations
+                  ON operations.operation_id = jobs.operation_id
+                WHERE operations.status = 'APPROVED'
+                  AND (
+                    jobs.status = 'QUEUED'
+                    OR (jobs.status = 'LEASED' AND jobs.lease_expires_at <= ?)
+                  )
+                ORDER BY jobs.created_at, jobs.operation_id
+                LIMIT 1""",
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+
+            next_token = int(row["fencing_token"]) + 1
+            cursor = connection.execute(
+                """UPDATE gateway_execution_jobs
+                SET status = 'LEASED', fencing_token = ?, worker_id = ?,
+                    lease_expires_at = ?, updated_at = ?
+                WHERE operation_id = ? AND fencing_token = ?
+                  AND (status = 'QUEUED' OR
+                       (status = 'LEASED' AND lease_expires_at <= ?))""",
+                (next_token, worker_id, lease_expires_at, timestamp,
+                 row["operation_id"], row["fencing_token"], timestamp),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            self._insert_gateway_event(
+                connection, row["operation_id"], "APPROVED", "APPROVED",
+                "WORKER_LEASED", "worker", worker_id,
+                "Worker acquired a bounded pre-dispatch lease.", timestamp,
+            )
+            connection.commit()
+            return {
+                "operation_id": row["operation_id"],
+                "policy_id": row["policy_id"],
+                "canonical_intent": row["canonical_intent"],
+                "worker_id": worker_id,
+                "fencing_token": next_token,
+                "lease_expires_at": lease_expires_at,
+            }
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def start_execution_job(
+        self,
+        operation_id: str,
+        worker_id: str,
+        fencing_token: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Cross the irreversible dispatch boundary while the lease is valid."""
+        if not isinstance(worker_id, str) or not worker_id.strip() or len(worker_id) > 100:
+            raise ValueError("worker_id must contain 1-100 non-whitespace characters.")
+        if type(fencing_token) is not int or fencing_token < 1:
+            raise ValueError("fencing_token must be a positive integer.")
+        reference_time = now or datetime.now(timezone.utc)
+        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+            raise ValueError("now must be timezone-aware.")
+        timestamp = reference_time.astimezone(timezone.utc).isoformat()
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                """SELECT status, worker_id, fencing_token, lease_expires_at
+                FROM gateway_execution_jobs WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            if (
+                job is None
+                or job["status"] != "LEASED"
+                or job["worker_id"] != worker_id
+                or job["fencing_token"] != fencing_token
+                or not job["lease_expires_at"]
+                or job["lease_expires_at"] <= timestamp
+            ):
+                connection.commit()
+                return False
+            operation = connection.execute(
+                "SELECT status FROM gateway_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if operation is None or operation["status"] != "APPROVED":
+                connection.commit()
+                return False
+            job_cursor = connection.execute(
+                """UPDATE gateway_execution_jobs
+                SET status = 'DISPATCH_STARTED', lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ? AND status = 'LEASED'
+                  AND worker_id = ? AND fencing_token = ?
+                  AND lease_expires_at > ?""",
+                (timestamp, operation_id, worker_id, fencing_token, timestamp),
+            )
+            if job_cursor.rowcount != 1:
+                connection.commit()
+                return False
+            operation_cursor = connection.execute(
+                """UPDATE gateway_operations SET status = 'EXECUTING', updated_at = ?
+                WHERE operation_id = ? AND status = 'APPROVED'""",
+                (timestamp, operation_id),
+            )
+            if operation_cursor.rowcount != 1:
+                raise RuntimeError("Operation state changed while starting execution.")
+            self._insert_gateway_event(
+                connection, operation_id, "APPROVED", "EXECUTING",
+                "DISPATCH_STARTED", "worker", worker_id,
+                "Worker durably marked dispatch as started; this job must not be replayed.",
+                timestamp,
+            )
+            connection.commit()
+            return True
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_execution_job(
+        self,
+        operation_id: str,
+        worker_id: str,
+        fencing_token: int,
+        status: str,
+        result: str | None = None,
+        *,
+        no_side_effect_confirmed: bool = False,
+    ) -> bool:
+        """Persist a worker result only while its dispatch fence is current."""
+        if status not in {"SUCCEEDED", "FAILED", "UNKNOWN"}:
+            raise ValueError("Invalid terminal gateway operation status.")
+        if result is not None and (not isinstance(result, str) or len(result) > 1000):
+            raise ValueError("Gateway operation result must be a string of at most 1000 characters.")
+        if not isinstance(worker_id, str) or not worker_id.strip() or len(worker_id) > 100:
+            raise ValueError("worker_id must contain 1-100 non-whitespace characters.")
+        if type(fencing_token) is not int or fencing_token < 1:
+            raise ValueError("fencing_token must be a positive integer.")
+        if type(no_side_effect_confirmed) is not bool:
+            raise ValueError("no_side_effect_confirmed must be a boolean.")
+        if status == "FAILED" and not no_side_effect_confirmed:
+            raise ValueError("FAILED requires confirmation that no side effect occurred.")
+        if status != "FAILED" and no_side_effect_confirmed:
+            raise ValueError("No-side-effect confirmation is valid only for FAILED.")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT operations.policy_id, operations.status,
+                          jobs.status AS job_status, jobs.worker_id,
+                          jobs.fencing_token
+                FROM gateway_operations AS operations
+                JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = operations.operation_id
+                WHERE operations.operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "EXECUTING"
+                or row["job_status"] != "DISPATCH_STARTED"
+                or row["worker_id"] != worker_id
+                or row["fencing_token"] != fencing_token
+            ):
+                connection.commit()
+                return False
+
+            timestamp = datetime.now(timezone.utc).isoformat()
+            operation_cursor = connection.execute(
+                """UPDATE gateway_operations
+                SET status = ?, result = ?, updated_at = ?
+                WHERE operation_id = ? AND status = 'EXECUTING'""",
+                (status, result, timestamp, operation_id),
+            )
+            if operation_cursor.rowcount != 1:
+                connection.commit()
+                return False
+            job_cursor = connection.execute(
+                """UPDATE gateway_execution_jobs
+                SET status = ?, worker_id = NULL, lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ? AND status = 'DISPATCH_STARTED'
+                  AND worker_id = ? AND fencing_token = ?""",
+                ("COMPLETED" if status in {"SUCCEEDED", "FAILED"} else "UNKNOWN",
+                 timestamp, operation_id, worker_id, fencing_token),
+            )
+            if job_cursor.rowcount != 1:
+                raise RuntimeError("Execution job fencing changed during completion.")
+
+            safe_reason = (
+                "Worker executor completed successfully." if status == "SUCCEEDED"
+                else "Trusted worker executor confirmed no side effect occurred." if status == "FAILED"
+                else "Worker execution outcome is uncertain."
+            )
+            self._insert_gateway_event(
+                connection, operation_id, "EXECUTING", status,
+                "EXECUTION_COMPLETED", "worker", worker_id, safe_reason, timestamp,
+            )
+
+            if status in {"SUCCEEDED", "FAILED"}:
+                next_reservation_status = "SETTLED" if status == "SUCCEEDED" else "RELEASED"
+                reservation = connection.execute(
+                    """UPDATE daily_reservations SET reservation_status = ?
+                    WHERE policy_id = ? AND request_id = ?
+                      AND allowed = 1 AND reservation_status = 'RESERVED'""",
+                    (next_reservation_status, row["policy_id"], f"gateway:{operation_id}"),
+                )
+                if reservation.rowcount != 1:
+                    raise RuntimeError("Gateway operation has no active budget reservation to settle or release.")
+                event_type = "RESERVATION_SETTLED" if status == "SUCCEEDED" else "RESERVATION_RELEASED"
+                event_reason = (
+                    "Approved budget reservation was committed after successful worker execution."
+                    if status == "SUCCEEDED"
+                    else "Budget reservation was released after the trusted worker confirmed no side effect."
+                )
+                self._insert_gateway_event(
+                    connection, operation_id, status, status, event_type,
+                    "worker", worker_id, event_reason, timestamp,
+                )
+            connection.commit()
+            return True
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_gateway_execution_status(self, operation_id: str) -> str | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT status FROM gateway_execution_jobs WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else str(row["status"])
 
     def claim_gateway_operation(
         self,
@@ -571,6 +873,17 @@ class SQLitePolicyStore:
                 WHERE operation_id = ? AND status = 'APPROVED'""",
                 (timestamp, operation_id),
             )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    """UPDATE gateway_execution_jobs
+                    SET status = 'DISPATCH_STARTED',
+                        fencing_token = fencing_token + 1,
+                        worker_id = 'inline-gateway',
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE operation_id = ? AND status = 'QUEUED'""",
+                    (timestamp, operation_id),
+                )
             if cursor.rowcount == 1:
                 self._insert_gateway_event(
                     connection, operation_id, "APPROVED", "EXECUTING",
@@ -633,6 +946,14 @@ class SQLitePolicyStore:
             if cursor.rowcount != 1:
                 connection.commit()
                 return False
+
+            connection.execute(
+                """UPDATE gateway_execution_jobs
+                SET status = ?, worker_id = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE operation_id = ? AND status = 'DISPATCH_STARTED'""",
+                ("COMPLETED" if status in {"SUCCEEDED", "FAILED"} else "UNKNOWN",
+                 timestamp, operation_id),
+            )
 
             safe_reason = (
                 "Executor completed successfully." if status == "SUCCEEDED"
@@ -749,6 +1070,14 @@ class SQLitePolicyStore:
                 ("Manually reconciled; outcome remains unknown.", timestamp, operation_id),
             )
             if cursor.rowcount == 1:
+                connection.execute(
+                    """UPDATE gateway_execution_jobs
+                    SET status = 'UNKNOWN', worker_id = NULL,
+                        lease_expires_at = NULL, updated_at = ?
+                    WHERE operation_id = ? AND status IN ('LEASED', 'DISPATCH_STARTED')""",
+                    (timestamp, operation_id),
+                )
+            if cursor.rowcount == 1:
                 self._insert_gateway_event(
                     connection, operation_id, "EXECUTING", "UNKNOWN",
                     "MANUAL_RECONCILIATION", "owner", actor_id,
@@ -812,6 +1141,13 @@ class SQLitePolicyStore:
                 )
                 if cursor.rowcount != 1:
                     continue
+                connection.execute(
+                    """UPDATE gateway_execution_jobs
+                    SET status = 'UNKNOWN', worker_id = NULL,
+                        lease_expires_at = NULL, updated_at = ?
+                    WHERE operation_id = ? AND status = 'DISPATCH_STARTED'""",
+                    (timestamp, operation_id),
+                )
                 self._insert_gateway_event(
                     connection, operation_id, "EXECUTING", "UNKNOWN",
                     "STALE_OPERATION_RECOVERY", "owner", actor_id, reason.strip(), timestamp,
