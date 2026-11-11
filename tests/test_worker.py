@@ -167,6 +167,43 @@ def test_worker_exception_becomes_unknown_without_replay(tmp_path):
     assert final["reservation_status"] == "RESERVED"
 
 
+def test_worker_result_persistence_failure_requires_unknown_recovery(tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    store, _, _, _, operation = setup_operation(tmp_path)
+    calls = []
+    worker = ExecutionWorker(
+        store,
+        lambda intent, operation_id: calls.append(operation_id),
+        "worker-a",
+    )
+    original_complete = store.complete_execution_job
+
+    def fail_persist(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(store, "complete_execution_job", fail_persist)
+    assert worker.run_once() is None
+    assert calls == [operation["operation_id"]]
+    pending = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert pending["status"] == "EXECUTING"
+    assert pending["reservation_status"] == "RESERVED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "DISPATCH_STARTED"
+
+    monkeypatch.setattr(store, "complete_execution_job", original_complete)
+    recovered = store.recover_stale_gateway_operations(
+        60,
+        now=datetime.now(timezone.utc) + timedelta(minutes=2),
+        reason="Worker returned but durable result persistence failed.",
+    )
+    assert recovered == [operation["operation_id"]]
+    assert worker.run_once() is None
+    final = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert final["status"] == "UNKNOWN"
+    assert final["reservation_status"] == "RESERVED"
+    assert calls == [operation["operation_id"]]
+
+
 def test_worker_typed_verified_failure_releases_reservation(tmp_path):
     store, _, _, _, operation = setup_operation(tmp_path, daily_limit="20")
     worker = ExecutionWorker(
