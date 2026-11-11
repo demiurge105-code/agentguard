@@ -363,6 +363,9 @@ class SQLitePolicyStore:
             "reservation_status": (
                 row["reservation_status"] if "reservation_status" in row.keys() else None
             ),
+            "execution_status": (
+                row["execution_status"] if "execution_status" in row.keys() else None
+            ),
         }
 
     @staticmethod
@@ -453,6 +456,8 @@ class SQLitePolicyStore:
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
                  AND reservations.request_id = 'gateway:' || operations.operation_id
+                LEFT JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = operations.operation_id
                 WHERE operations.idempotency_key = ?""",
                 (idempotency_key,),
             ).fetchone()
@@ -542,6 +547,8 @@ class SQLitePolicyStore:
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
                  AND reservations.request_id = 'gateway:' || operations.operation_id
+                LEFT JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = operations.operation_id
                 WHERE operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
@@ -1027,6 +1034,8 @@ class SQLitePolicyStore:
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
                  AND reservations.request_id = 'gateway:' || operations.operation_id
+                LEFT JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = operations.operation_id
                 WHERE operations.policy_id = ? AND operations.idempotency_key = ?""",
                 (policy_id, idempotency_key),
             ).fetchone()
@@ -1043,6 +1052,8 @@ class SQLitePolicyStore:
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
                  AND reservations.request_id = 'gateway:' || operations.operation_id
+                LEFT JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = operations.operation_id
                 WHERE operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
