@@ -275,8 +275,8 @@ def create_app(
 
         try:
             # This authenticated lookup supplies the policy's immutable chain
-            # context. The gateway reauthenticates during reservation and claim,
-            # so token rotation between these steps still fails closed.
+            # context. The store reauthenticates atomically when it reserves the
+            # budget and enqueues the job; this HTTP request never invokes an executor.
             policy = get_store().get_policy_authenticated(data.policy_id, agent_token)
             if policy is None:
                 raise HTTPException(
