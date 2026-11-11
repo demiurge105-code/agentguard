@@ -213,6 +213,10 @@ class SQLitePolicyStore:
         agent_token: str | None = None,
     ) -> Decision | None:
         """Atomically authenticate (when supplied), evaluate, and reserve budget."""
+        if isinstance(amount, (bool, float)):
+            raise ValueError(
+                "amount must be a Decimal or decimal string, not a float."
+            )
         transaction_amount = Decimal(amount)
         utc_day = (
             (now or datetime.now(timezone.utc))
