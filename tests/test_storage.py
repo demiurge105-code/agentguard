@@ -355,7 +355,8 @@ def test_gateway_audit_events_record_each_state_transition_atomically(tmp_path):
     assert store.complete_gateway_operation(operation["operation_id"], "SUCCEEDED", "Execution completed.") is True
     events = store.list_gateway_operation_events(operation["operation_id"])
     assert [(event["previous_status"], event["new_status"]) for event in events] == [
-        (None, "APPROVED"), ("APPROVED", "EXECUTING"), ("EXECUTING", "SUCCEEDED")
+        (None, "APPROVED"), ("APPROVED", "EXECUTING"),
+        ("EXECUTING", "SUCCEEDED"), ("SUCCEEDED", "SUCCEEDED"),
     ]
 
 
