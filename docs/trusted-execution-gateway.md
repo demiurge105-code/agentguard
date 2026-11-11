@@ -50,7 +50,7 @@ The current flow is:
 1. The caller supplies one `ActionIntent`, an agent token, and an idempotency key.
 2. In one SQLite `BEGIN IMMEDIATE` transaction, the store authenticates the token against the policy, checks the idempotency key, verifies that the intent chain context matches the stored policy, evaluates the policy, reserves daily budget, and creates an operation record.
 3. An allowed operation is persisted as `APPROVED`. A denied operation is persisted as `DENIED` and never reaches the executor.
-4. The gateway atomically changes `APPROVED` to `EXECUTING`. Only the caller that wins this compare-and-set transition may invoke the gateway-owned executor.
+4. The gateway revalidates the current agent token and atomically changes `APPROVED` to `EXECUTING`. Only the caller that wins this compare-and-set transition may invoke the gateway-owned executor. A token revoked before this claim cannot execute; revocation after the claim does not cancel an already-started operation.
 5. The executor receives the same immutable `ActionIntent` and stable operation ID. The gateway does not rebuild amount or recipient fields from a separate payload.
 6. The outcome is persisted as `SUCCEEDED`. If the executor raises or returns unsupported data, the operation becomes `UNKNOWN`. Arbitrary executor output and exception messages are not persisted; only a fixed status message is stored.
 
