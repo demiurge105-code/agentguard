@@ -26,6 +26,22 @@ Goals:
 
 These are design goals, not guarantees of the current implementation.
 
+## Implemented building block: ActionIntent
+
+The core package now provides `agentguard.ActionIntent` as the validated input contract for the first gateway step. It is a frozen, slotted dataclass containing:
+
+- `policy_id`: a canonical UUID identifying the policy context;
+- `amount`: a positive finite Decimal within the policy engine's existing precision and exponent bounds;
+- `recipient`: normalized through the existing chain-aware recipient helpers;
+- `chain_id`: the normalized EVM CAIP-2 identifier, or `null` for legacy mode.
+
+The model rejects boolean and float amounts, non-finite or non-positive amounts, malformed policy UUIDs, invalid recipients, and unsupported chain identifiers. It does not modify the current API or demo flow; the future gateway must construct this value before evaluation or reservation.
+
+`canonical_json` emits compact, key-sorted JSON with a schema version. Amounts are encoded as decimal strings in fixed-point form, with insignificant fractional trailing zeros removed. Therefore `1`, `1.0`, and `1.00` share the same monetary identity, while distinct numeric values remain distinct. `canonical_bytes` exposes the exact UTF-8 bytes for a later digest.
+
+The idempotency key is intentionally excluded. A future durable operation record must bind the caller-scoped key to both the policy identity and this canonical representation. Canonicalization alone does not authorize an action, prevent replay, or provide tamper-proof storage.
+
+
 ## Trust boundaries
 
 | Component | Trust level | Responsibility |
