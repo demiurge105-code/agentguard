@@ -280,7 +280,7 @@ The current implementation consists of:
 - **Policy engine** — evaluates a request and returns a deterministic decision.
 - **SQLite policy store** — persists policies, agent-token hashes, daily reservations, and gateway operation states separately from the policy engine.
 - **Trusted Execution Gateway** — authenticates and reserves atomically, binds idempotency keys to canonical intents, and owns the print-only executor exposed through `/gateway/operations`.
-- **FastAPI interface** — exposes owner-authenticated policy management and the backward-compatible agent-authenticated transaction-evaluation endpoint.
+- **FastAPI interface** — exposes owner-authenticated policy management, the backward-compatible `/check-transaction` endpoint, and the authenticated `/gateway/operations` execution endpoint.
 - **Tests and examples** — demonstrate and verify the simulation behaviour.
 
 See [docs/architecture.md](docs/architecture.md) for more detail.
