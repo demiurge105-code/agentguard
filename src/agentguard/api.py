@@ -8,7 +8,8 @@ import secrets
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentguard.chains import normalize_chain_id, normalize_recipient
@@ -80,13 +81,20 @@ class TransactionInput(BaseModel):
         return value
 
 
-def _bearer_token(authorization: str | None) -> str | None:
-    """Extract a Bearer credential without accepting malformed headers."""
-    if authorization is None:
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _bearer_token(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    """Extract a Bearer credential without accepting malformed values."""
+    if credentials is None:
         return None
-    scheme, separator, token = authorization.partition(" ")
-    if not separator or scheme.lower() != "bearer" or not token or token.strip() != token:
+
+    token = credentials.credentials
+    if not token or token.strip() != token:
         return None
+
     return token
 
 
@@ -113,8 +121,10 @@ def create_app(
 
     application = FastAPI(title="AgentGuard API")
 
-    def require_admin(authorization: str | None) -> None:
-        supplied_token = _bearer_token(authorization)
+    def require_admin(
+        credentials: HTTPAuthorizationCredentials | None,
+    ) -> None:
+        supplied_token = _bearer_token(credentials)
         if (
             not admin_token
             or supplied_token is None
@@ -132,9 +142,9 @@ def create_app(
     @application.post("/policies", status_code=status.HTTP_201_CREATED)
     def create_policy(
         data: PolicyInput,
-        authorization: str | None = Header(default=None),
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     ) -> dict[str, object]:
-        require_admin(authorization)
+        require_admin(credentials)
         policy = Policy(
             data.max_transaction,
             data.daily_limit,
@@ -157,9 +167,9 @@ def create_app(
     @application.post("/policies/{policy_id}/rotate-agent-token")
     def rotate_agent_token(
         policy_id: str,
-        authorization: str | None = Header(default=None),
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     ) -> dict[str, str]:
-        require_admin(authorization)
+        require_admin(credentials)
         agent_token = secrets.token_urlsafe(32)
         if not get_store().rotate_agent_token(policy_id, _token_hash(agent_token)):
             raise HTTPException(
@@ -171,9 +181,9 @@ def create_app(
     @application.post("/check-transaction")
     def check_transaction_api(
         data: TransactionInput,
-        authorization: str | None = Header(default=None),
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     ) -> dict[str, object]:
-        agent_token = _bearer_token(authorization)
+        agent_token = _bearer_token(credentials)
         if agent_token is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
