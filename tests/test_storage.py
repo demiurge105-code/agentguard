@@ -457,6 +457,18 @@ def test_verified_failure_releases_reservation_and_allows_new_budget(tmp_path):
     assert next_operation["status"] == "APPROVED"
 
 
+def test_released_gateway_budget_is_available_to_legacy_endpoint(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+    store = SQLitePolicyStore(tmp_path / "legacy-after-release.db")
+    token = "legacy-release-token"
+    policy_id = store.create_policy(Policy("100", "20", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "legacy-release")
+    store.claim_gateway_operation(operation["operation_id"], token)
+    assert store.complete_gateway_operation(operation["operation_id"], "FAILED", no_side_effect_confirmed=True)
+    decision = store.evaluate_and_reserve(policy_id, "15", "Alice", "legacy-after-release")
+    assert decision.allowed is True
+
 def test_failed_status_requires_explicit_no_side_effect_confirmation(tmp_path):
     import hashlib
     from agentguard.intent import ActionIntent
