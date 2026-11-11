@@ -451,7 +451,8 @@ class SQLitePolicyStore:
                 return None
 
             previous = connection.execute(
-                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                """SELECT operations.*, reservations.reservation_status AS reservation_status,
+                       jobs.status AS execution_status
                 FROM gateway_operations AS operations
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
@@ -542,7 +543,8 @@ class SQLitePolicyStore:
                     (operation_id, timestamp, timestamp),
                 )
             row = connection.execute(
-                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                """SELECT operations.*, reservations.reservation_status AS reservation_status,
+                       jobs.status AS execution_status
                 FROM gateway_operations AS operations
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
@@ -1029,7 +1031,8 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             row = connection.execute(
-                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                """SELECT operations.*, reservations.reservation_status AS reservation_status,
+                       jobs.status AS execution_status
                 FROM gateway_operations AS operations
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
@@ -1047,7 +1050,8 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             row = connection.execute(
-                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                """SELECT operations.*, reservations.reservation_status AS reservation_status,
+                       jobs.status AS execution_status
                 FROM gateway_operations AS operations
                 LEFT JOIN daily_reservations AS reservations
                   ON reservations.policy_id = operations.policy_id
