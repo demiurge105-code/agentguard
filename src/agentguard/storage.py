@@ -197,15 +197,11 @@ class SQLitePolicyStore:
                 )
 
                 # Older releases persisted APPROVED operations before durable worker
-                # jobs existed. Recreate only work that is still safely pre-dispatch:
-                # never replay EXECUTING, UNKNOWN, or terminal operations.
+                # jobs existed. Capture only rows that this migration will enqueue so
+                # their audit events are precise even when they already have history.
                 connection.execute(
-                    """INSERT INTO gateway_execution_jobs (
-                        operation_id, status, fencing_token, worker_id,
-                        lease_expires_at, created_at, updated_at
-                    )
-                    SELECT operations.operation_id, 'QUEUED', 0, NULL, NULL,
-                           operations.updated_at, operations.updated_at
+                    """CREATE TEMP TABLE _agentguard_backfilled_jobs AS
+                    SELECT operations.operation_id, operations.updated_at
                     FROM gateway_operations AS operations
                     LEFT JOIN gateway_execution_jobs AS jobs
                       ON jobs.operation_id = operations.operation_id
@@ -213,33 +209,27 @@ class SQLitePolicyStore:
                       AND operations.allowed = 1
                       AND jobs.operation_id IS NULL"""
                 )
-                # The LEGACY_IMPORT event identifies operations that predate the
-                # worker outbox. Record the backfill once, in this same transaction.
+                connection.execute(
+                    """INSERT INTO gateway_execution_jobs (
+                        operation_id, status, fencing_token, worker_id,
+                        lease_expires_at, created_at, updated_at
+                    )
+                    SELECT operation_id, 'QUEUED', 0, NULL, NULL,
+                           updated_at, updated_at
+                    FROM _agentguard_backfilled_jobs"""
+                )
                 connection.execute(
                     """INSERT INTO gateway_operation_events (
                         operation_id, previous_status, new_status, event_type,
                         actor_type, actor_id, reason, created_at
                     )
-                    SELECT jobs.operation_id, 'APPROVED', 'APPROVED',
+                    SELECT operation_id, 'APPROVED', 'APPROVED',
                            'EXECUTION_JOB_BACKFILL', 'system', 'schema-migration',
                            'Queued legacy approved operation during worker outbox migration.',
-                           jobs.created_at
-                    FROM gateway_execution_jobs AS jobs
-                    JOIN gateway_operations AS operations
-                      ON operations.operation_id = jobs.operation_id
-                    WHERE operations.status = 'APPROVED'
-                      AND operations.allowed = 1
-                      AND EXISTS (
-                          SELECT 1 FROM gateway_operation_events AS imported
-                          WHERE imported.operation_id = jobs.operation_id
-                            AND imported.event_type = 'LEGACY_IMPORT'
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM gateway_operation_events AS backfill
-                          WHERE backfill.operation_id = jobs.operation_id
-                            AND backfill.event_type = 'EXECUTION_JOB_BACKFILL'
-                      )"""
+                           updated_at
+                    FROM _agentguard_backfilled_jobs"""
                 )
+                connection.execute("DROP TABLE _agentguard_backfilled_jobs")
         finally:
             connection.close()
 
