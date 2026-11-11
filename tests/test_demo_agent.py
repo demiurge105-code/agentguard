@@ -1,13 +1,9 @@
-import hashlib
 import io
 from pathlib import Path
 import runpy
 from urllib.error import HTTPError, URLError
 
 import pytest
-
-from agentguard.policy import Policy
-from agentguard.storage import SQLitePolicyStore
 
 
 DEMO_AGENT = runpy.run_path(
@@ -112,72 +108,70 @@ def test_api_request_rejects_non_object_json_response(monkeypatch, body):
         call_api_request()
 
 
-def make_demo_database(path):
-    token = "agent-secret-token"
-    store = SQLitePolicyStore(path)
-    policy_id = store.create_policy(
-        Policy("50", "100", ["0xDemoRecipient"]),
-        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+def test_api_request_adds_idempotency_header_without_overriding_auth(monkeypatch):
+    captured = {}
+
+    def return_response(request, timeout):
+        captured["request"] = request
+        return FakeResponse(b'{"ok": true}')
+
+    monkeypatch.setitem(api_request.__globals__, "urlopen", return_response)
+    result = api_request(
+        "http://127.0.0.1:8000",
+        "/gateway/operations",
+        {"amount": "1"},
+        "agent-token",
+        extra_headers={"Idempotency-Key": "unique-key"},
     )
-    return store, policy_id, token
+
+    assert result == {"ok": True}
+    assert captured["request"].get_header("Authorization") == "Bearer agent-token"
+    assert captured["request"].get_header("Idempotency-key") == "unique-key"
 
 
-def test_run_demo_uses_gateway_and_only_executes_allowed_proposal(
-    tmp_path, monkeypatch, capsys
-):
-    db_path = tmp_path / "demo.db"
-    store, policy_id, token = make_demo_database(db_path)
+def test_run_demo_submits_both_proposals_through_gateway_endpoint(monkeypatch, capsys):
+    calls = []
+    policy_id = "123e4567-e89b-12d3-a456-426614174000"
+    agent_token = "agent-secret-token"
 
-    def fake_api_request(base_url, path, payload, bearer_token):
-        assert path == "/policies"
-        assert bearer_token == "admin-secret-token"
-        assert payload["max_transaction"] == "50"
-        return {"policy_id": policy_id, "agent_token": token}
+    def fake_api_request(base_url, path, payload, bearer_token, extra_headers=None):
+        assert base_url == "http://127.0.0.1:8000"
+        if path == "/policies":
+            assert bearer_token == "admin-secret-token"
+            return {"policy_id": policy_id, "agent_token": agent_token}
 
-    executions = []
-
-    class CountingExecutor:
-        def __call__(self, intent, operation_id):
-            executions.append((intent, operation_id))
-            return None
+        assert path == "/gateway/operations"
+        assert bearer_token == agent_token
+        assert extra_headers and extra_headers["Idempotency-Key"].startswith("demo-")
+        calls.append((payload, extra_headers["Idempotency-Key"]))
+        index = len(calls)
+        return {
+            "operation_id": f"operation-{index}",
+            "status": "SUCCEEDED" if index == 1 else "DENIED",
+            "allowed": index == 1,
+            "reason": "test decision",
+        }
 
     monkeypatch.setitem(run_demo.__globals__, "api_request", fake_api_request)
-    monkeypatch.setitem(run_demo.__globals__, "PrintOnlyExecutor", CountingExecutor)
 
-    run_demo("http://127.0.0.1:8000", "admin-secret-token", db_path)
+    run_demo("http://127.0.0.1:8000", "admin-secret-token")
 
     output = capsys.readouterr().out
     assert "SUCCEEDED" in output
     assert "DENIED" in output
-    assert len(executions) == 1
-    assert executions[0][0].amount == 25
-    assert executions[0][0].recipient == "0xdemoRecipient".lower()
-
-    connection = store._connect()
-    try:
-        operations = connection.execute(
-            "SELECT status FROM gateway_operations ORDER BY created_at"
-        ).fetchall()
-    finally:
-        connection.close()
-    assert len(operations) == 2
-    assert {row["status"] for row in operations} == {"SUCCEEDED", "DENIED"}
-
-
-def test_run_demo_stops_if_api_and_demo_use_different_databases(tmp_path, monkeypatch):
-    _, policy_id, token = make_demo_database(tmp_path / "api.db")
-    monkeypatch.setitem(
-        run_demo.__globals__,
-        "api_request",
-        lambda *args, **kwargs: {"policy_id": policy_id, "agent_token": token},
-    )
-
-    with pytest.raises(RuntimeError, match="same database path"):
-        run_demo(
-            "http://127.0.0.1:8000",
-            "admin-secret-token",
-            tmp_path / "different.db",
-        )
+    assert len(calls) == 2
+    assert calls[0][0] == {
+        "policy_id": policy_id,
+        "amount": "25",
+        "recipient": "0xdemorecipient",
+    }
+    assert calls[1][0] == {
+        "policy_id": policy_id,
+        "amount": "75",
+        "recipient": "0xdemorecipient",
+    }
+    assert calls[0][1] != calls[1][1]
+    assert agent_token not in output
 
 
 @pytest.mark.parametrize(
@@ -204,13 +198,18 @@ def test_run_demo_rejects_incomplete_policy_response_without_printing_credential
     assert "agent-secret-token" not in output
 
 
-def test_run_demo_does_not_continue_when_policy_creation_fails(monkeypatch):
-    def failing_api_request(*args, **kwargs):
-        raise RuntimeError("AgentGuard unavailable")
+def test_run_demo_stops_when_gateway_request_fails(monkeypatch):
+    def failing_api_request(base_url, path, payload, token, extra_headers=None):
+        if path == "/policies":
+            return {
+                "policy_id": "123e4567-e89b-12d3-a456-426614174000",
+                "agent_token": "agent-secret-token",
+            }
+        raise RuntimeError("Gateway unavailable")
 
     monkeypatch.setitem(run_demo.__globals__, "api_request", failing_api_request)
 
-    with pytest.raises(RuntimeError, match="AgentGuard unavailable"):
+    with pytest.raises(RuntimeError, match="Gateway unavailable"):
         run_demo("http://127.0.0.1:8000", "admin-secret-token")
 
 
