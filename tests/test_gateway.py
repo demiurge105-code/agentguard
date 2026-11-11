@@ -388,3 +388,31 @@ def test_operation_key_is_separate_from_legacy_reservation_ids(tmp_path):
 
     assert result.status is OperationStatus.SUCCEEDED
     assert len(calls) == 1
+
+
+def test_typed_verified_failure_releases_daily_budget(tmp_path):
+    from agentguard.gateway import ExecutionOutcome
+    store, policy_id, token = make_store(tmp_path, daily_limit="20")
+    gateway = TrustedExecutionGateway(store, lambda intent, operation_id: ExecutionOutcome(OperationStatus.FAILED, no_side_effect_confirmed=True))
+    failed = gateway.submit(make_intent(policy_id, "10"), token, "verified-failure")
+    assert failed.status is OperationStatus.FAILED
+    assert store.get_gateway_operation_by_id(failed.operation_id)["reservation_status"] == "RELEASED"
+    successful = TrustedExecutionGateway(store, lambda intent, operation_id: None).submit(make_intent(policy_id, "15"), token, "after-verified-failure")
+    assert successful.status is OperationStatus.SUCCEEDED
+
+
+def test_unknown_executor_outcome_keeps_budget_reserved(tmp_path):
+    from agentguard.gateway import ExecutionOutcome
+    store, policy_id, token = make_store(tmp_path, daily_limit="20")
+    gateway = TrustedExecutionGateway(store, lambda intent, operation_id: ExecutionOutcome(OperationStatus.UNKNOWN))
+    unknown = gateway.submit(make_intent(policy_id, "10"), token, "unknown-outcome")
+    assert unknown.status is OperationStatus.UNKNOWN
+    assert store.get_gateway_operation_by_id(unknown.operation_id)["reservation_status"] == "RESERVED"
+    denied = TrustedExecutionGateway(store, lambda intent, operation_id: None).submit(make_intent(policy_id, "11"), token, "after-unknown")
+    assert denied.status is OperationStatus.DENIED
+
+
+def test_execution_outcome_rejects_failed_without_no_side_effect_proof():
+    from agentguard.gateway import ExecutionOutcome
+    with pytest.raises(ValueError, match="no side effect"):
+        ExecutionOutcome(OperationStatus.FAILED)
