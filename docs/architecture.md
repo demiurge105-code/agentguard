@@ -143,6 +143,7 @@ The Gateway endpoint accepts an agent bearer token, a required `Idempotency-Key`
 The API first performs an authenticated policy-context lookup to obtain the stored `chain_id`. This lookup is not the execution authorization: the gateway reauthenticates atomically when creating/reserving the operation and again when claiming `APPROVED -> EXECUTING`. A token revoked between those stages cannot reach the executor.
 
 The caller cannot provide chain context, policy limits, daily-spent values, executor configuration, or other extra fields. The route constructs ActionIntent with the chain ID loaded from policy storage and delegates to TrustedExecutionGateway with the server-owned PrintOnlyExecutor.
+ActionIntent currently requires canonical UUID policy IDs. Newly created policies satisfy this; older migrated policies with non-UUID identifiers can continue using `/check-transaction` but are not accepted by the gateway endpoint.
 
 Responses include the operation ID, status, allow/deny decision, reason code, and timestamps. Invalid credentials return HTTP 401 without disclosing policy existence; conflicting idempotency reuse returns HTTP 409; invalid input returns HTTP 422; storage errors return HTTP 503. A denial is a normal operation response with status DENIED, not an HTTP error.
 
