@@ -27,7 +27,9 @@ The current implementation includes:
 - A FastAPI endpoint that authenticates an agent before evaluating a request.
 - Atomic server-side daily reservations and idempotent request handling.
 - An in-process TrustedExecutionGateway with durable operation records and a single atomic execution claim.
-- An append-only SQLite event history for gateway operation creation and state transitions.
+- An append-only SQLite event history for gateway operation creation, state transitions, and reservation changes.
+- Explicit `RESERVED`, `SETTLED`, `RELEASED`, and `NOT_RESERVED` budget reservation states.
+- Atomic settlement after successful execution and release only after a trusted executor confirms no side effect occurred.
 - Owner-authenticated operation inspection and manual `EXECUTING -> UNKNOWN` reconciliation.
 - Idempotent gateway retries that do not invoke the executor twice, including after an unresolved execution attempt.
 - Automated tests and pull-request CI.
@@ -266,7 +268,7 @@ Content-Type: application/json
 }
 ```
 
-The reason and owner actor are recorded atomically with the state change. Reconciliation does not prove whether an external side effect occurred and never permits automatic retry. The API intentionally does not allow manual claims of `SUCCEEDED` or `FAILED` without a future executor-specific verification contract. Existing operation rows receive an explicit `LEGACY_IMPORT` event; their earlier history cannot be reconstructed.
+The reason and owner actor are recorded atomically with the state change. Reconciliation does not prove whether an external side effect occurred and never permits automatic retry. The API intentionally does not allow manual claims of `SUCCEEDED` or `FAILED`. A trusted executor may return a typed `ExecutionOutcome`; it may report `FAILED` only when its own contract establishes that no side effect occurred. Exceptions and unsupported results remain `UNKNOWN`. Existing operation rows receive an explicit `LEGACY_IMPORT` event; their earlier history cannot be reconstructed.
 
 The existing `/check-transaction` endpoint remains available for policy evaluation and budget reservation without execution.
 
@@ -289,7 +291,7 @@ On startup, AgentGuard adds the nullable `agent_token_hash` column to an older S
 
 This is still a simulation interface, not a secure transaction-enforcement boundary.
 
-Daily usage is derived from SQLite reservations. Evaluation and reservation run in one serialized write transaction, so concurrent requests cannot collectively reserve more than the daily limit. Only allowed requests reserve budget; denied requests do not. Usage resets at 00:00 UTC. A reservation is budget allocated to an allowed simulated request, not proof that funds were spent or a transaction was broadcast; settlement and release are not implemented.
+Daily usage is derived from SQLite reservations. Evaluation and reservation run in one serialized write transaction, so concurrent requests cannot collectively reserve more than the daily limit. Gateway operations begin as `RESERVED`; `SUCCEEDED` atomically changes the reservation to `SETTLED`, while a typed trusted-executor `FAILED` outcome can change it to `RELEASED` only when no side effect is confirmed. `UNKNOWN` keeps the reservation active. Legacy `/check-transaction` allowed decisions continue to consume the daily budget. Only allowed requests reserve budget; denied requests do not. Usage is grouped by the UTC day on which the reservation was created. A reservation is budget allocated to an allowed simulated request, not proof that funds were spent or a transaction was broadcast.
 
 Per-policy agent tokens authenticate access to the evaluation API and gateway service. They do not prove that a caller is the legitimate wallet owner. The gateway is currently an in-process service; malicious code with the same process privileges can still bypass it, and the existing /check-transaction endpoint is not routed through the gateway. Do not use this system as the sole control protecting real funds.
 
@@ -312,7 +314,7 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 Planned areas of work include:
 
 1. A dedicated gateway HTTP integration so remote agents can submit operations without accessing the SQLite store directly.
-2. Reservation settlement/release and stronger audit integrity beyond the application-level append-only event history.
+2. Stronger audit integrity beyond the application-level append-only event history.
 3. External developer feedback and independent security review.
 4. Process isolation and further research before any wallet or testnet execution integration.
 
