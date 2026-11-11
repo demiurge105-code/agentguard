@@ -57,7 +57,7 @@ def test_policy_uuid_is_canonicalized():
     assert intent.policy_id == POLICY_ID
 
 
-@pytest.mark.parametrize("policy_id", ["", "not-a-uuid", "123e4567e89b12d3a456426614174000", None, 123])
+@pytest.mark.parametrize("policy_id", ["", "not-a-uuid", "123e4567e89b12d3a456426614174000", "{123e4567-e89b-12d3-a456-426614174000}", "urn:uuid:123e4567-e89b-12d3-a456-426614174000", None, 123])
 def test_rejects_malformed_policy_identifiers(policy_id):
     with pytest.raises(ValueError, match="policy_id"):
         ActionIntent(policy_id, "1", "Alice")
