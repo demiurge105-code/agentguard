@@ -78,7 +78,7 @@ def test_same_key_with_different_intent_conflicts(tmp_path, different_intent):
     store, policy_id, token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or "ok"
+        store, lambda intent, operation_id: calls.append(operation_id) or None
     )
     first_intent = make_intent(policy_id)
     gateway.submit(first_intent, token, "conflicting-key")
@@ -171,6 +171,39 @@ def test_executor_exception_becomes_unknown_and_is_not_retried(tmp_path):
     assert first.result == "Executor raised an exception; outcome may be unknown."
 
 
+def test_unsupported_executor_output_is_not_persisted(tmp_path):
+    store, policy_id, token = make_store(tmp_path)
+    gateway = TrustedExecutionGateway(
+        store, lambda intent, operation_id: "secret-looking-output"
+    )
+
+    result = gateway.submit(make_intent(policy_id), token, "unsupported-output")
+
+    assert result.status is OperationStatus.UNKNOWN
+    assert result.result == "Executor returned unsupported data; outcome may be unknown."
+    assert "secret-looking-output" not in (result.result or "")
+
+
+def test_successful_operation_reserves_budget_only_once(tmp_path):
+    store, policy_id, token = make_store(tmp_path, daily_limit="20")
+    calls = []
+    gateway = TrustedExecutionGateway(
+        store, lambda intent, operation_id: calls.append(operation_id) or None
+    )
+    intent = make_intent(policy_id, amount="10")
+
+    first = gateway.submit(intent, token, "budget-once")
+    retry = gateway.submit(intent, token, "budget-once")
+    second_operation = gateway.submit(
+        make_intent(policy_id, amount="11"), token, "budget-next"
+    )
+
+    assert first == retry
+    assert first.status is OperationStatus.SUCCEEDED
+    assert second_operation.status is OperationStatus.DENIED
+    assert len(calls) == 1
+
+
 def test_crash_after_durable_claim_never_triggers_automatic_retry(tmp_path):
     store, policy_id, token = make_store(tmp_path)
     intent = make_intent(policy_id)
@@ -197,7 +230,7 @@ def test_concurrent_exact_retries_invoke_executor_at_most_once(tmp_path):
         with lock:
             calls.append(operation_id)
         time.sleep(0.05)
-        return "once"
+        return None
 
     gateway = TrustedExecutionGateway(store, executor)
     intent = make_intent(policy_id)
