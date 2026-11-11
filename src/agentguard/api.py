@@ -25,6 +25,13 @@ class PolicyInput(BaseModel):
     allowed_recipients: list[str]
     chain_id: str | None = None
 
+    @field_validator("max_transaction", "daily_limit", mode="before")
+    @classmethod
+    def require_decimal_string(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("Policy amounts must be provided as decimal strings.")
+        return value
+
     @field_validator("max_transaction", "daily_limit")
     @classmethod
     def validate_finite_amounts(cls, value: Decimal) -> Decimal:
@@ -58,6 +65,13 @@ class TransactionInput(BaseModel):
     request_id: str = Field(min_length=1, max_length=200)
     amount: Decimal = Field(gt=0)
     recipient: str = Field(min_length=1)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def require_decimal_string(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("Transaction amount must be provided as a decimal string.")
+        return value
 
     @field_validator("amount")
     @classmethod
