@@ -305,10 +305,19 @@ def create_app(
                 data.recipient,
                 chain_id=policy.chain_id,
             )
-            result = TrustedExecutionGateway(
-                get_store(),
-                PrintOnlyExecutor(),
-            ).submit(intent, agent_token, idempotency_key)
+            operation = get_store().begin_gateway_operation(
+                intent,
+                agent_token,
+                idempotency_key,
+            )
+            if operation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or missing agent token.",
+                )
+            execution_status = get_store().get_gateway_execution_status(
+                str(operation["operation_id"])
+            )
         except GatewayAuthenticationError as error:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -325,15 +334,16 @@ def create_app(
             ) from error
 
         return {
-            "operation_id": result.operation_id,
-            "policy_id": result.policy_id,
-            "status": result.status.value,
-            "allowed": result.allowed,
-            "reason_code": result.reason_code,
-            "reason": result.reason,
-            "result": result.result,
-            "created_at": result.created_at,
-            "updated_at": result.updated_at,
+            "operation_id": operation["operation_id"],
+            "policy_id": operation["policy_id"],
+            "status": operation["status"],
+            "execution_status": execution_status or "NOT_QUEUED",
+            "allowed": operation["allowed"],
+            "reason_code": operation["reason_code"],
+            "reason": operation["reason"],
+            "result": operation["result"],
+            "created_at": operation["created_at"],
+            "updated_at": operation["updated_at"],
         }
 
     @application.get("/gateway/operations/{operation_id}")
