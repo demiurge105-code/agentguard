@@ -1005,3 +1005,41 @@ async def test_gateway_audit_owner_endpoints_return_404_for_unknown_operation(ap
         events = await client.get("/gateway/operations/not-found/events", headers=headers)
         reconcile = await client.post("/gateway/operations/not-found/reconcile", json={"reason": "Investigated."}, headers=headers)
     assert [operation.status_code, events.status_code, reconcile.status_code] == [404, 404, 404]
+
+
+@pytest.mark.anyio
+async def test_owner_can_recover_stale_operations_but_agent_cannot(app, admin_token):
+    from datetime import timedelta
+    from agentguard.intent import ActionIntent
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        store = app.state.store
+        pending = store.begin_gateway_operation(ActionIntent(created["policy_id"], "10", "Alice"), created["agent_token"], "stale-api")
+        assert store.claim_gateway_operation(pending["operation_id"], created["agent_token"]) is True
+        connection = store._connect()
+        try:
+            connection.execute("UPDATE gateway_operations SET updated_at = ? WHERE operation_id = ?", ((datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(), pending["operation_id"]))
+            connection.commit()
+        finally:
+            connection.close()
+        agent_headers = {"Authorization": f"Bearer {created['agent_token']}"}
+        owner_headers = {"Authorization": f"Bearer {admin_token}"}
+        denied = await client.post("/gateway/operations/recover-stale", json={"stale_after_seconds": 300, "reason": "Restarted."}, headers=agent_headers)
+        recovered = await client.post("/gateway/operations/recover-stale", json={"stale_after_seconds": 300, "reason": "Process restarted; inspect outcome."}, headers=owner_headers)
+        operation = await client.get(f"/gateway/operations/{pending['operation_id']}", headers=owner_headers)
+    assert denied.status_code == 401
+    assert recovered.status_code == 200
+    assert recovered.json()["recovered_count"] == 1
+    assert recovered.json()["operation_ids"] == [pending["operation_id"]]
+    assert operation.json()["status"] == "UNKNOWN"
+    assert operation.json()["reservation_status"] == "RESERVED"
+
+
+@pytest.mark.anyio
+async def test_stale_recovery_api_rejects_invalid_age_and_empty_reason(app, admin_token):
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        short_age = await client.post("/gateway/operations/recover-stale", json={"stale_after_seconds": 5, "reason": "test"}, headers=headers)
+        empty_reason = await client.post("/gateway/operations/recover-stale", json={"stale_after_seconds": 300, "reason": "  "}, headers=headers)
+    assert short_age.status_code == 422
+    assert empty_reason.status_code == 422
