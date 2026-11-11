@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document proposes a simulation-only architecture step. It is a design, not a description of current functionality.
+This document combines the threat model with implementation status. AgentGuard remains simulation-only. The first in-process gateway building block is implemented, but the existing HTTP API and demo flow are not yet routed through it.
 
 Today, AgentGuard evaluates and reserves a proposed action. The demo agent then decides whether to call a print-only simulated executor. An agent with another execution path, wallet, signer, RPC endpoint, or direct tool can bypass that flow.
 
@@ -40,6 +40,35 @@ The model rejects boolean and float amounts, non-finite or non-positive amounts,
 `canonical_json` emits compact, key-sorted JSON with a schema version. Amounts are encoded as decimal strings in fixed-point form, with insignificant fractional trailing zeros removed. Therefore `1`, `1.0`, and `1.00` share the same monetary identity, while distinct numeric values remain distinct. `canonical_bytes` exposes the exact UTF-8 bytes for a later digest.
 
 The idempotency key is intentionally excluded. A future durable operation record must bind the caller-scoped key to both the policy identity and this canonical representation. Canonicalization alone does not authorize an action, prevent replay, or provide tamper-proof storage.
+
+## Implemented: in-process Gateway v1
+
+The core package now includes `TrustedExecutionGateway`, backed by SQLite operation records and a gateway-owned executor reference.
+
+The current flow is:
+
+1. The caller supplies one `ActionIntent`, an agent token, and an idempotency key.
+2. In one SQLite `BEGIN IMMEDIATE` transaction, the store authenticates the token against the policy, checks the idempotency key, verifies that the intent chain context matches the stored policy, evaluates the policy, reserves daily budget, and creates an operation record.
+3. An allowed operation is persisted as `APPROVED`. A denied operation is persisted as `DENIED` and never reaches the executor.
+4. The gateway revalidates the current agent token and atomically changes `APPROVED` to `EXECUTING`. Only the caller that wins this compare-and-set transition may invoke the gateway-owned executor. A token revoked before this claim cannot execute; revocation after the claim does not cancel an already-started operation.
+5. The executor receives the same immutable `ActionIntent` and stable operation ID. The gateway does not rebuild amount or recipient fields from a separate payload.
+6. The outcome is persisted as `SUCCEEDED`. If the executor raises or returns unsupported data, the operation becomes `UNKNOWN`. Arbitrary executor output and exception messages are not persisted; only a fixed status message is stored.
+
+The persisted operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. The current gateway uses `UNKNOWN` for ambiguous executor outcomes. `FAILED` is reserved for a future executor contract that can prove a failure had no side effect.
+
+Idempotency keys are globally unique within the SQLite database and are bound to the policy ID and exact canonical intent. Reusing a key with a different policy or intent returns an idempotency conflict. Gateway reservations use a random operation-scoped reservation ID so caller-controlled legacy `request_id` values cannot collide with the gateway's reservation records.
+
+An exact retry returns the stored operation. It does not call the executor again. Concurrent retries compete for the single durable `APPROVED -> EXECUTING` transition; at most one can win. A crash after the transition leaves the operation in `EXECUTING`; retries do not execute it again. An operator can explicitly mark an unresolved operation `UNKNOWN`, but this does not authorize another attempt.
+
+### Current limitations
+
+- `PrintOnlyExecutor` only prints a simulated action; no transaction is sent.
+- The gateway is an in-process service, not an OS security boundary. Malicious Python code with the same process privileges can still import modules or use independent capabilities.
+- The existing `/check-transaction` API and `examples/demo_agent.py` are not yet integrated with this gateway. They retain their existing behavior, so the demo agent can still choose its own print-only execution path.
+- There is no gateway HTTP endpoint, reservation release/settlement, automated crash recovery, or exactly-once guarantee for external side effects.
+- If the process crashes after claiming `EXECUTING`, the operation may remain unresolved until manually reconciled. This is deliberately fail-closed and can reduce availability.
+- Operation records are not tamper-proof audit logs. The SQLite database remains part of the trusted computing base.
+
 
 
 ## Trust boundaries
