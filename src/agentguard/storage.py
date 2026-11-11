@@ -330,17 +330,10 @@ class SQLitePolicyStore:
             if normalized_recipient != recipient:
                 raise ValueError("ActionIntent recipient is not normalized for the stored policy.")
 
-            # Keep gateway idempotency keys separate from legacy request_id values.
-            reservation_id = f"gateway:{idempotency_key}"
-            previous_reservation = connection.execute(
-                """SELECT 1 FROM daily_reservations
-                WHERE policy_id = ? AND request_id = ?""",
-                (policy_id, reservation_id),
-            ).fetchone()
-            if previous_reservation is not None:
-                raise IdempotencyConflict(
-                    "A reservation already exists for this gateway idempotency key."
-                )
+            # Use a random operation-scoped reservation ID rather than the
+            # caller's key so legacy API request_id values cannot collide.
+            operation_id = str(uuid.uuid4())
+            reservation_id = f"gateway:{operation_id}"
 
             usage = connection.execute(
                 """SELECT amount FROM daily_reservations
@@ -369,7 +362,6 @@ class SQLitePolicyStore:
                     decision.reason,
                 ),
             )
-            operation_id = str(uuid.uuid4())
             status = "APPROVED" if decision.allowed else "DENIED"
             connection.execute(
                 """INSERT INTO gateway_operations (
