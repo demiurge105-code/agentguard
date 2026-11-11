@@ -38,8 +38,13 @@ class ExecutionWorker:
             raise TypeError("store must be a SQLitePolicyStore.")
         if not callable(executor):
             raise TypeError("executor must be callable.")
-        if not isinstance(worker_id, str) or not worker_id.strip() or len(worker_id) > 100:
-            raise ValueError("worker_id must contain 1-100 non-whitespace characters.")
+        if (
+            not isinstance(worker_id, str)
+            or not worker_id
+            or worker_id.strip() != worker_id
+            or len(worker_id) > 100
+        ):
+            raise ValueError("worker_id must contain 1-100 non-whitespace characters without surrounding whitespace.")
         if type(lease_seconds) is not int or not 5 <= lease_seconds <= 300:
             raise ValueError("lease_seconds must be an integer between 5 and 300.")
         self._store = store
