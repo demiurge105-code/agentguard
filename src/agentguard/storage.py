@@ -852,13 +852,20 @@ class SQLitePolicyStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT gateway_operations.status, policies.agent_token_hash
+                """SELECT gateway_operations.status, policies.agent_token_hash,
+                          jobs.status AS job_status
                 FROM gateway_operations
                 JOIN policies ON policies.policy_id = gateway_operations.policy_id
+                LEFT JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = gateway_operations.operation_id
                 WHERE gateway_operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
-            if row is None or row["status"] != "APPROVED":
+            if (
+                row is None
+                or row["status"] != "APPROVED"
+                or (row["job_status"] is not None and row["job_status"] != "QUEUED")
+            ):
                 connection.commit()
                 return False
             supplied_hash = hashlib.sha256(agent_token.encode("utf-8")).hexdigest()
