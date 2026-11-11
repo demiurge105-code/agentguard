@@ -137,6 +137,67 @@ def test_invalid_token_does_not_reserve_or_execute(tmp_path):
     assert reservations == 0
 
 
+def test_revoked_token_cannot_replay_existing_operation(tmp_path):
+    store, policy_id, old_token = make_store(tmp_path)
+    calls = []
+    gateway = TrustedExecutionGateway(
+        store, lambda intent, operation_id: calls.append(operation_id) or None
+    )
+    intent = make_intent(policy_id)
+    gateway.submit(intent, old_token, "rotate-before-retry")
+
+    new_token = "replacement-token"
+    store.rotate_agent_token(
+        policy_id,
+        hashlib.sha256(new_token.encode("utf-8")).hexdigest(),
+    )
+
+    with pytest.raises(GatewayAuthenticationError):
+        gateway.submit(intent, old_token, "rotate-before-retry")
+
+    assert len(calls) == 1
+
+
+def test_failed_execution_claim_never_invokes_executor(tmp_path, monkeypatch):
+    store, policy_id, token = make_store(tmp_path)
+    calls = []
+
+    def fail_claim(operation_id):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(store, "claim_gateway_operation", fail_claim)
+    gateway = TrustedExecutionGateway(
+        store, lambda intent, operation_id: calls.append(operation_id) or None
+    )
+
+    with pytest.raises(OSError, match="database unavailable"):
+        gateway.submit(make_intent(policy_id), token, "claim-failure")
+
+    assert calls == []
+
+
+def test_failed_completion_persistence_does_not_retry_executor(tmp_path, monkeypatch):
+    store, policy_id, token = make_store(tmp_path)
+    calls = []
+    gateway = TrustedExecutionGateway(
+        store, lambda intent, operation_id: calls.append(operation_id) or None
+    )
+    original_complete = store.complete_gateway_operation
+
+    def fail_completion(operation_id, status, result=None):
+        return False
+
+    monkeypatch.setattr(store, "complete_gateway_operation", fail_completion)
+    with pytest.raises(RuntimeError, match="could not be persisted"):
+        gateway.submit(make_intent(policy_id), token, "completion-failure")
+
+    monkeypatch.setattr(store, "complete_gateway_operation", original_complete)
+    retry = gateway.submit(make_intent(policy_id), token, "completion-failure")
+
+    assert retry.status is OperationStatus.EXECUTING
+    assert len(calls) == 1
+
+
 def test_policy_denial_never_calls_executor(tmp_path):
     store, policy_id, token = make_store(tmp_path, max_transaction="5")
     calls = []
