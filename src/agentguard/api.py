@@ -108,6 +108,20 @@ class GatewayOperationInput(BaseModel):
     recipient: object = Field(json_schema_extra={"type": "string"})
 
 
+class GatewayStaleRecoveryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stale_after_seconds: int = Field(ge=60, le=604800)
+    limit: int = Field(default=100, ge=1, le=100)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Recovery reason must not be empty or whitespace.")
+        return value.strip()
+
 class GatewayReconciliationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -355,6 +369,30 @@ def create_app(
         if events is None:
             raise HTTPException(status_code=404, detail="Gateway operation not found.")
         return {"operation_id": operation_id, "events": events}
+
+    @application.post("/gateway/operations/recover-stale")
+    def recover_stale_gateway_operations(
+        data: GatewayStaleRecoveryInput,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> dict[str, object]:
+        require_admin(credentials)
+        try:
+            recovered = get_store().recover_stale_gateway_operations(
+                data.stale_after_seconds,
+                limit=data.limit,
+                actor_id="owner-api",
+                reason=data.reason,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except sqlite3.Error as error:
+            raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
+        return {
+            "recovered_count": len(recovered),
+            "operation_ids": recovered,
+            "status": "UNKNOWN",
+            "note": "Recovery does not retry execution or release budget reservations.",
+        }
 
     @application.post("/gateway/operations/{operation_id}/reconcile")
     def reconcile_gateway_operation(
