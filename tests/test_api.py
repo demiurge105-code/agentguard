@@ -920,7 +920,7 @@ async def test_gateway_endpoint_storage_failure_during_enqueue_fails_closed(
     operation = app.state.store.get_gateway_operation(
         created["policy_id"], "gateway-storage-failure"
     )
-    assert operation["status"] == "APPROVED"
+    assert operation is None
 
 
 @pytest.mark.anyio
