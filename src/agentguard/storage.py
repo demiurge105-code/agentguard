@@ -430,8 +430,12 @@ class SQLitePolicyStore:
                 return None
 
             previous = connection.execute(
-                """SELECT * FROM gateway_operations
-                WHERE idempotency_key = ?""",
+                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                FROM gateway_operations AS operations
+                LEFT JOIN daily_reservations AS reservations
+                  ON reservations.policy_id = operations.policy_id
+                 AND reservations.request_id = 'gateway:' || operations.operation_id
+                WHERE operations.idempotency_key = ?""",
                 (idempotency_key,),
             ).fetchone()
             if previous is not None:
@@ -670,6 +674,7 @@ class SQLitePolicyStore:
             raise
         finally:
             connection.close()
+
     def get_gateway_operation(
         self,
         policy_id: str,
@@ -694,7 +699,12 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             row = connection.execute(
-                "SELECT * FROM gateway_operations WHERE operation_id = ?",
+                """SELECT operations.*, reservations.reservation_status AS reservation_status
+                FROM gateway_operations AS operations
+                LEFT JOIN daily_reservations AS reservations
+                  ON reservations.policy_id = operations.policy_id
+                 AND reservations.request_id = 'gateway:' || operations.operation_id
+                WHERE operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
         finally:
@@ -820,7 +830,8 @@ class SQLitePolicyStore:
 
             usage = connection.execute(
                 """SELECT amount FROM daily_reservations
-                WHERE policy_id = ? AND utc_day = ? AND allowed = 1""",
+                WHERE policy_id = ? AND utc_day = ? AND allowed = 1
+                  AND reservation_status IN ('RESERVED', 'SETTLED')""",
                 (policy_id, utc_day),
             ).fetchall()
             # Aggregate reservations with the same exact precision used by
@@ -836,8 +847,8 @@ class SQLitePolicyStore:
             decision = check_transaction(request, policy)
             connection.execute(
                 """INSERT INTO daily_reservations
-                (policy_id, request_id, utc_day, amount, recipient, allowed, reason_code, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (policy_id, request_id, utc_day, amount, recipient, allowed, reason_code, reason, reservation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     policy_id,
                     request_id,
