@@ -108,6 +108,19 @@ class GatewayOperationInput(BaseModel):
     recipient: object = Field(json_schema_extra={"type": "string"})
 
 
+class GatewayReconciliationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Reconciliation reason must not be empty or whitespace.")
+        return value.strip()
+
+
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -307,6 +320,68 @@ def create_app(
             "result": result.result,
             "created_at": result.created_at,
             "updated_at": result.updated_at,
+        }
+
+    @application.get("/gateway/operations/{operation_id}")
+    def get_gateway_operation(
+        operation_id: str,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> dict[str, object]:
+        require_admin(credentials)
+        try:
+            operation = get_store().get_gateway_operation_by_id(operation_id)
+        except sqlite3.Error as error:
+            raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
+        if operation is None:
+            raise HTTPException(status_code=404, detail="Gateway operation not found.")
+        return {
+            key: operation[key]
+            for key in (
+                "operation_id", "policy_id", "status", "allowed",
+                "reason_code", "reason", "result", "created_at", "updated_at",
+            )
+        }
+
+    @application.get("/gateway/operations/{operation_id}/events")
+    def get_gateway_operation_events(
+        operation_id: str,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> dict[str, object]:
+        require_admin(credentials)
+        try:
+            events = get_store().list_gateway_operation_events(operation_id)
+        except sqlite3.Error as error:
+            raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
+        if events is None:
+            raise HTTPException(status_code=404, detail="Gateway operation not found.")
+        return {"operation_id": operation_id, "events": events}
+
+    @application.post("/gateway/operations/{operation_id}/reconcile")
+    def reconcile_gateway_operation(
+        operation_id: str,
+        data: GatewayReconciliationInput,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> dict[str, object]:
+        require_admin(credentials)
+        try:
+            changed = get_store().reconcile_gateway_operation_unknown(
+                operation_id, "owner", data.reason
+            )
+            operation = get_store().get_gateway_operation_by_id(operation_id)
+        except sqlite3.Error as error:
+            raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
+        if operation is None:
+            raise HTTPException(status_code=404, detail="Gateway operation not found.")
+        if not changed:
+            raise HTTPException(
+                status_code=409,
+                detail="Only an EXECUTING operation can be reconciled to UNKNOWN.",
+            )
+        return {
+            "operation_id": operation_id,
+            "status": operation["status"],
+            "reconciled": True,
+            "note": "UNKNOWN does not authorize another execution attempt.",
         }
 
     return application
