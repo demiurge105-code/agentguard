@@ -98,7 +98,7 @@ def test_same_idempotency_key_under_different_policy_conflicts(tmp_path):
     store, policy_id, token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or "ok"
+        store, lambda intent, operation_id: calls.append(operation_id) or None
     )
     gateway.submit(make_intent(policy_id), token, "global-key")
 
@@ -284,7 +284,7 @@ def test_operation_key_is_separate_from_legacy_reservation_ids(tmp_path):
 
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or "ok"
+        store, lambda intent, operation_id: calls.append(operation_id) or None
     )
     result = gateway.submit(make_intent(policy_id), token, "shared-key")
 
