@@ -26,6 +26,8 @@ The current implementation includes:
 - Per-policy agent tokens; only SHA-256 token hashes are stored.
 - A FastAPI endpoint that authenticates an agent before evaluating a request.
 - Atomic server-side daily reservations and idempotent request handling.
+- An in-process TrustedExecutionGateway with durable operation records and a single atomic execution claim.
+- Idempotent gateway retries that do not invoke the executor twice, including after an unresolved execution attempt.
 - Automated tests and pull-request CI.
 
 The engine checks rules in this order: maximum transaction amount, daily spending limit, then recipient allowlist. The first failed rule determines the denial reason.
@@ -121,15 +123,15 @@ If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotatio
 
 ### Run the demo agent
 
-Use `examples/demo_agent.py` as the canonical API demo. It creates a policy through the local API and proposes two hypothetical transactions. For each proposal, it asks AgentGuard for a decision before reaching the simulated executor:
+Use `examples/demo_agent.py` as the canonical Gateway v1 demo. It creates a policy through the local FastAPI endpoint, opens the same SQLite database, then submits two immutable `ActionIntent` objects to `TrustedExecutionGateway`.
 
-Each proposal is represented by a frozen `TransactionIntent` containing its description, exact `Decimal` amount, and recipient. The API check payload is built from that object, and the simulated executor receives the same object rather than separately reconstructed values. This demonstrates in-process intent consistency; it is not a cryptographic authorization proof and does not prevent a malicious agent from bypassing the demo flow.
+The demo does **not** call `/check-transaction` and then decide for itself whether to execute. The gateway authenticates the agent token, evaluates and reserves budget, persists the operation, atomically claims execution, and invokes its own `PrintOnlyExecutor` only for an approved action.
 
-- If the response contains the literal boolean `"allowed": true`, the demo prints that the simulated action would execute.
-- If AgentGuard returns `DENY`, omits the `allowed` field, or returns a non-boolean value, the simulated executor is skipped.
-- If the API request fails or returns an invalid response, the demo stops without simulating execution.
+- The first proposal is within the per-transaction limit and should finish as `SUCCEEDED`.
+- The second proposal exceeds the per-transaction limit and should finish as `DENIED`; the executor is not called.
+- Operation IDs and statuses are printed. The agent token is kept in memory and never printed.
 
-The agent is deterministic and uses Python's standard library; no LLM API key or wallet is required.
+The demo is deterministic; no LLM API key or wallet is required.
 
 Start the API from the repository root in one terminal. Set an owner token before starting it:
 
@@ -161,9 +163,9 @@ $env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
 python examples/demo_agent.py
 ```
 
-The demo creates a new policy on each run. It proposes one transaction within the per-transaction limit (expected: `ALLOW`) and one above that limit (expected: `DENY`). The returned agent token is kept in memory and is not printed. The script accepts only a local loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
+Both processes must use the same `AGENTGUARD_DB_PATH`. If unset, each uses `agentguard.db` in its current working directory, so run both from the repository root or set the same absolute path in both terminals. The demo accepts only a loopback API URL; if needed, set `AGENTGUARD_API_URL` to a URL such as `http://localhost:8000`.
 
-All proposals and executor actions are simulations. The demo does not use an LLM, connect to a wallet, sign or broadcast transactions, or prevent an agent from bypassing the API. The executor is deliberately a print-only placeholder, not a production transaction adapter.
+All proposals and executor actions are simulations. The print-only executor does not connect to a wallet, sign or broadcast transactions, or move funds. The gateway is an in-process application boundary, not a sandbox against malicious Python code running with the same process privileges. The existing `/check-transaction` API remains available for backward compatibility, but it is not protected by the gateway in this milestone.
 
 ### Create a policy
 
@@ -242,7 +244,7 @@ This is still a simulation interface, not a secure transaction-enforcement bound
 
 Daily usage is derived from SQLite reservations. Evaluation and reservation run in one serialized write transaction, so concurrent requests cannot collectively reserve more than the daily limit. Only allowed requests reserve budget; denied requests do not. Usage resets at 00:00 UTC. A reservation is budget allocated to an allowed simulated request, not proof that funds were spent or a transaction was broadcast; settlement and release are not implemented.
 
-Per-policy agent tokens authenticate access to the evaluation API. They do not prove that a caller is the legitimate wallet owner, and they do not stop an agent from bypassing AgentGuard entirely. Do not use this API as the sole control protecting real funds.
+Per-policy agent tokens authenticate access to the evaluation API and gateway service. They do not prove that a caller is the legitimate wallet owner. The gateway is currently an in-process service; malicious code with the same process privileges can still bypass it, and the existing /check-transaction endpoint is not routed through the gateway. Do not use this system as the sole control protecting real funds.
 
 ## Architecture
 
@@ -251,8 +253,9 @@ The current implementation consists of:
 - **Policy and request models** — validate policy limits, transaction amounts, and recipient identifiers.
 - **Chain adapters** — validate EVM CAIP-2 chain identifiers and normalize EVM addresses; other chain namespaces are not implemented yet.
 - **Policy engine** — evaluates a request and returns a deterministic decision.
-- **SQLite policy store** — persists policies, agent-token hashes, and daily reservations separately from the policy engine.
-- **FastAPI interface** — exposes owner-authenticated policy management and agent-authenticated transaction evaluation.
+- **SQLite policy store** — persists policies, agent-token hashes, daily reservations, and gateway operation states separately from the policy engine.
+- **Trusted Execution Gateway** — authenticates and reserves atomically, binds idempotency keys to canonical intents, and owns the only executor reference used by the demo.
+- **FastAPI interface** — exposes owner-authenticated policy management and the backward-compatible agent-authenticated transaction-evaluation endpoint.
 - **Tests and examples** — demonstrate and verify the simulation behaviour.
 
 See [docs/architecture.md](docs/architecture.md) for more detail.
@@ -261,10 +264,10 @@ See [docs/architecture.md](docs/architecture.md) for more detail.
 
 Planned areas of work include:
 
-1. Reservation settlement/release and a decision log.
-2. An LLM-backed agent adapter built on top of the deterministic API demo.
-3. External developer feedback and security review.
-4. Further security design and isolated wallet or testnet integration research.
+1. A dedicated gateway HTTP integration so remote agents can submit operations without accessing the SQLite store directly.
+2. Reservation settlement/release and a tamper-evident audit design.
+3. External developer feedback and independent security review.
+4. Process isolation and further research before any wallet or testnet execution integration.
 
 The roadmap may change as the project is tested with developers and potential users.
 
