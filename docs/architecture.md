@@ -26,9 +26,9 @@ The canonical `examples/demo_agent.py` exercises the authenticated HTTP Gateway 
 5. The API authenticates the token to obtain policy context, then the gateway reauthenticates atomically when creating/reserving the operation and again when claiming `APPROVED -> EXECUTING`. A token revoked between those stages cannot reach the executor.
 6. The store binds the globally unique idempotency key to the policy and canonical intent, evaluates policy, reserves budget, and persists the operation in one `BEGIN IMMEDIATE` transaction.
 7. Only the request that wins the atomic execution claim may invoke the server-owned `PrintOnlyExecutor`. The executor receives the same immutable `ActionIntent` and stable operation ID.
-8. The gateway persists `SUCCEEDED` or `UNKNOWN`. Executor exceptions and arbitrary executor return data are not stored. An ambiguous operation is never automatically executed again.
+8. The gateway persists `SUCCEEDED`, `FAILED`, or `UNKNOWN` from its trusted executor outcome contract. Executor exceptions and arbitrary executor return data are not stored. An ambiguous operation is never automatically executed again.
 
-The operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. `FAILED` is reserved for a future executor contract that can prove no side effect occurred. If the process crashes after `EXECUTING` is committed, the operation remains unresolved until manually reconciled; retries do not invoke the executor again.
+The operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. A trusted executor may return a typed `ExecutionOutcome`; `FAILED` is accepted only when its contract confirms no side effect occurred. If the process crashes after `EXECUTING` is committed, the operation remains unresolved until manually reconciled; retries do not invoke the executor again.
 
 Idempotency keys are globally unique within the SQLite database. Reuse with a different policy or canonical intent conflicts. Gateway reservations use a random operation-scoped reservation ID rather than the caller-provided key, avoiding collisions with legacy `/check-transaction` request IDs.
 
@@ -83,7 +83,7 @@ The gateway owns a callable executor reference and accepts only a validated `Act
 
 Only the request that changes `APPROVED` to `EXECUTING` may call the executor. Retries return the stored state. Concurrent retries cannot claim the same operation twice. The gateway never automatically re-executes an operation left in `EXECUTING` after a crash. Operators can explicitly mark such an operation `UNKNOWN`, but this does not authorize a retry.
 
-The current `PrintOnlyExecutor` only prints a simulated action. Arbitrary executor return values and exception messages are not stored. `FAILED` is reserved for a future executor contract that can establish that no side effect occurred; ambiguous outcomes are recorded as `UNKNOWN`.
+The current `PrintOnlyExecutor` only prints a simulated action and uses the backward-compatible `None` return to indicate success. A future executor can return `ExecutionOutcome`; it must return `FAILED` only when its own verification contract establishes that no side effect occurred. Arbitrary executor return values and exception messages are not stored; ambiguous outcomes are recorded as `UNKNOWN`.
 
 Every operation creation and subsequent status transition is accompanied by an append-only `gateway_operation_events` row in the same SQLite transaction. Events include transition, actor type/identifier, bounded reason, and timestamp, but never credentials or arbitrary executor data. Existing operations are migrated with a `LEGACY_IMPORT` event that explicitly states earlier transitions are unavailable.
 
