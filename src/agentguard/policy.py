@@ -136,6 +136,10 @@ def _deny(reason_code: DecisionReason, reason: str) -> Decision:
 
 
 def _as_decimal(value: Decimal | str, field_name: str) -> Decimal:
+    if isinstance(value, (bool, float)):
+        raise ValueError(
+            f"{field_name} must be a Decimal or decimal string, not a float."
+        )
     try:
         amount = Decimal(value)
     except Exception as error:

@@ -279,3 +279,16 @@ def test_evm_policy_validates_original_recipient_before_legacy_normalization():
     assert request.recipient == ("0X" + address[2:]).lower()
     with pytest.raises(ValueError, match="20-byte hexadecimal"):
         check_transaction(request, policy)
+
+
+
+@pytest.mark.parametrize("value", [0.1, 1.5, True, False])
+def test_rejects_float_and_boolean_money_inputs(value):
+    with pytest.raises(ValueError, match="Decimal or decimal string"):
+        Policy(value, "200", ["0xABC"])
+
+    with pytest.raises(ValueError, match="Decimal or decimal string"):
+        TransactionRequest(value, "0xABC", "0")
+
+    with pytest.raises(ValueError, match="Decimal or decimal string"):
+        TransactionRequest("10", "0xABC", value)
