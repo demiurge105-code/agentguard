@@ -7,11 +7,18 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 from agentguard.chains import normalize_recipient
-from agentguard.policy import Decision, DecisionReason, Policy, TransactionRequest, check_transaction
+from agentguard.policy import (
+    EXACT_ARITHMETIC_PRECISION,
+    Decision,
+    DecisionReason,
+    Policy,
+    TransactionRequest,
+    check_transaction,
+)
 
 
 class IdempotencyConflict(ValueError):
@@ -267,9 +274,13 @@ class SQLitePolicyStore:
                 WHERE policy_id = ? AND utc_day = ? AND allowed = 1""",
                 (policy_id, utc_day),
             ).fetchall()
-            daily_reserved = sum(
-                (Decimal(row["amount"]) for row in usage), Decimal("0")
-            )
+            # Aggregate reservations with the same exact precision used by
+            # the policy engine; the default Decimal context can round totals.
+            with localcontext() as context:
+                context.prec = EXACT_ARITHMETIC_PRECISION
+                daily_reserved = sum(
+                    (Decimal(row["amount"]) for row in usage), Decimal("0")
+                )
             request = TransactionRequest(
                 transaction_amount, normalised_recipient, daily_reserved
             )
