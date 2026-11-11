@@ -315,9 +315,7 @@ def create_app(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid or missing agent token.",
                 )
-            execution_status = get_store().get_gateway_execution_status(
-                str(operation["operation_id"])
-            )
+            execution_status = operation["execution_status"]
         except GatewayAuthenticationError as error:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -354,7 +352,6 @@ def create_app(
         require_admin(credentials)
         try:
             operation = get_store().get_gateway_operation_by_id(operation_id)
-            execution_status = get_store().get_gateway_execution_status(operation_id)
         except sqlite3.Error as error:
             raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
         if operation is None:
