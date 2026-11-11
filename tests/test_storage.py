@@ -335,3 +335,90 @@ def test_exact_aggregate_at_daily_limit_is_denied_without_validation_error(tmp_p
     assert second.allowed is True
     assert third.allowed is False
     assert third.reason_code is DecisionReason.DAILY_LIMIT_EXCEEDED
+
+
+def test_gateway_audit_events_record_each_state_transition_atomically(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+
+    store = SQLitePolicyStore(tmp_path / "audit.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-key"
+    )
+    assert [event["new_status"] for event in store.list_gateway_operation_events(operation["operation_id"])] == ["APPROVED"]
+    assert store.claim_gateway_operation(operation["operation_id"], token) is True
+    assert store.complete_gateway_operation(operation["operation_id"], "SUCCEEDED", "Execution completed.") is True
+    events = store.list_gateway_operation_events(operation["operation_id"])
+    assert [(event["previous_status"], event["new_status"]) for event in events] == [
+        (None, "APPROVED"), ("APPROVED", "EXECUTING"), ("EXECUTING", "SUCCEEDED")
+    ]
+
+
+def test_gateway_audit_insert_failure_rolls_back_operation_and_reservation(tmp_path, monkeypatch):
+    import hashlib
+    from agentguard.intent import ActionIntent
+
+    store = SQLitePolicyStore(tmp_path / "audit-atomic.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(Policy("100", "200", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    original = store._insert_gateway_event
+    monkeypatch.setattr(store, "_insert_gateway_event", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("audit insert failed")))
+    with pytest.raises(RuntimeError, match="audit insert failed"):
+        store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "audit-rollback")
+    monkeypatch.setattr(store, "_insert_gateway_event", original)
+    connection = store._connect()
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_operations").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM daily_reservations").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_owner_reconciliation_records_reason_and_never_retries(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+
+    store = SQLitePolicyStore(tmp_path / "audit-reconcile.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(Policy("100", "200", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "reconcile-key")
+    assert store.claim_gateway_operation(operation["operation_id"], token) is True
+    assert store.reconcile_gateway_operation_unknown(operation["operation_id"], "owner", "Process restarted; outcome unknown.") is True
+    assert store.reconcile_gateway_operation_unknown(operation["operation_id"], "owner", "Duplicate reconciliation.") is False
+    assert store.claim_gateway_operation(operation["operation_id"], token) is False
+    events = store.list_gateway_operation_events(operation["operation_id"])
+    assert events[-1]["event_type"] == "MANUAL_RECONCILIATION"
+    assert events[-1]["actor_type"] == "owner"
+    assert events[-1]["reason"] == "Process restarted; outcome unknown."
+
+
+def test_reconciliation_requires_bounded_nonempty_reason(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-reason.db")
+    with pytest.raises(ValueError, match="reason"):
+        store.reconcile_gateway_operation_unknown("missing", "owner", "  ")
+    with pytest.raises(ValueError, match="reason"):
+        store.reconcile_gateway_operation_unknown("missing", "owner", "x" * 501)
+
+
+def test_concurrent_owner_reconciliation_creates_only_one_event(tmp_path):
+    import hashlib
+    from agentguard.intent import ActionIntent
+
+    store = SQLitePolicyStore(tmp_path / "audit-race.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(Policy("100", "200", ["Alice"]), hashlib.sha256(token.encode()).hexdigest())
+    operation = store.begin_gateway_operation(ActionIntent(policy_id, "10", "Alice"), token, "reconcile-race")
+    store.claim_gateway_operation(operation["operation_id"], token)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(
+            lambda i: store.reconcile_gateway_operation_unknown(operation["operation_id"], "owner", f"Operator review {i}."),
+            range(8),
+        ))
+    assert sum(results) == 1
+    events = store.list_gateway_operation_events(operation["operation_id"])
+    assert sum(event["event_type"] == "MANUAL_RECONCILIATION" for event in events) == 1

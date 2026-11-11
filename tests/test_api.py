@@ -955,3 +955,52 @@ async def test_gateway_endpoint_concurrent_retries_execute_once(app, admin_token
     assert app.state.store.get_gateway_operation(
         created["policy_id"], "gateway-concurrent"
     )["status"] == "SUCCEEDED"
+
+
+@pytest.mark.anyio
+async def test_gateway_audit_endpoints_require_owner(app, admin_token):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        submitted = await submit_gateway(client, created["policy_id"], "owner-audit", created["agent_token"])
+        operation_id = submitted.json()["operation_id"]
+        agent_headers = {"Authorization": f"Bearer {created['agent_token']}"}
+        denied = await client.get(f"/gateway/operations/{operation_id}", headers=agent_headers)
+        denied_events = await client.get(f"/gateway/operations/{operation_id}/events", headers=agent_headers)
+        denied_reconcile = await client.post(f"/gateway/operations/{operation_id}/reconcile", json={"reason": "checked"}, headers=agent_headers)
+        owner_headers = {"Authorization": f"Bearer {admin_token}"}
+        read = await client.get(f"/gateway/operations/{operation_id}", headers=owner_headers)
+        events = await client.get(f"/gateway/operations/{operation_id}/events", headers=owner_headers)
+    assert [denied.status_code, denied_events.status_code, denied_reconcile.status_code] == [401, 401, 401]
+    assert read.status_code == events.status_code == 200
+    assert events.json()["events"][0]["event_type"] == "OPERATION_CREATED"
+    assert "agent_token" not in read.json()
+
+
+@pytest.mark.anyio
+async def test_owner_can_reconcile_unresolved_operation_to_unknown(app, admin_token):
+    from agentguard.intent import ActionIntent
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        store = app.state.store
+        pending = store.begin_gateway_operation(ActionIntent(created["policy_id"], "10", "Alice"), created["agent_token"], "pending-owner-reconcile")
+        assert store.claim_gateway_operation(pending["operation_id"], created["agent_token"]) is True
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        missing = await client.post(f"/gateway/operations/{pending['operation_id']}/reconcile", json={"reason": "   "}, headers=headers)
+        reconciled = await client.post(f"/gateway/operations/{pending['operation_id']}/reconcile", json={"reason": "Process restarted; outcome unknown."}, headers=headers)
+        duplicate = await client.post(f"/gateway/operations/{pending['operation_id']}/reconcile", json={"reason": "Second attempt."}, headers=headers)
+        events = await client.get(f"/gateway/operations/{pending['operation_id']}/events", headers=headers)
+    assert missing.status_code == 422
+    assert reconciled.status_code == 200 and reconciled.json()["status"] == "UNKNOWN"
+    assert duplicate.status_code == 409
+    assert events.json()["events"][-1]["event_type"] == "MANUAL_RECONCILIATION"
+
+
+@pytest.mark.anyio
+async def test_gateway_audit_owner_endpoints_return_404_for_unknown_operation(app, admin_token):
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        operation = await client.get("/gateway/operations/not-found", headers=headers)
+        events = await client.get("/gateway/operations/not-found/events", headers=headers)
+        reconcile = await client.post("/gateway/operations/not-found/reconcile", json={"reason": "Investigated."}, headers=headers)
+    assert [operation.status_code, events.status_code, reconcile.status_code] == [404, 404, 404]

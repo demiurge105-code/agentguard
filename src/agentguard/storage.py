@@ -112,6 +112,39 @@ class SQLitePolicyStore:
                     """CREATE INDEX IF NOT EXISTS idx_gateway_operations_status
                     ON gateway_operations(status, updated_at)"""
                 )
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS gateway_operation_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        operation_id TEXT NOT NULL,
+                        previous_status TEXT,
+                        new_status TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        actor_type TEXT NOT NULL,
+                        actor_id TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (operation_id) REFERENCES gateway_operations(operation_id)
+                    )"""
+                )
+                connection.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_gateway_operation_events_operation
+                    ON gateway_operation_events(operation_id, event_id)"""
+                )
+                connection.execute(
+                    """INSERT INTO gateway_operation_events (
+                        operation_id, previous_status, new_status, event_type,
+                        actor_type, actor_id, reason, created_at
+                    )
+                    SELECT operation_id, NULL, status, 'LEGACY_IMPORT',
+                           'system', 'schema-migration',
+                           'Imported existing operation; prior transitions are unavailable.',
+                           updated_at
+                    FROM gateway_operations AS operations
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM gateway_operation_events AS events
+                        WHERE events.operation_id = operations.operation_id
+                    )"""
+                )
         finally:
             connection.close()
 
@@ -279,6 +312,29 @@ class SQLitePolicyStore:
             "updated_at": row["updated_at"],
         }
 
+    @staticmethod
+    def _insert_gateway_event(
+        connection: sqlite3.Connection,
+        operation_id: str,
+        previous_status: str | None,
+        new_status: str,
+        event_type: str,
+        actor_type: str,
+        actor_id: str,
+        reason: str,
+        created_at: str,
+    ) -> None:
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise ValueError("Audit reason must contain 1-500 non-whitespace characters.")
+        connection.execute(
+            """INSERT INTO gateway_operation_events (
+                operation_id, previous_status, new_status, event_type,
+                actor_type, actor_id, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (operation_id, previous_status, new_status, event_type,
+             actor_type, actor_id, reason.strip(), created_at),
+        )
+
     def begin_gateway_operation(
         self,
         intent: object,
@@ -417,6 +473,12 @@ class SQLitePolicyStore:
                 "SELECT * FROM gateway_operations WHERE operation_id = ?",
                 (operation_id,),
             ).fetchone()
+            self._insert_gateway_event(
+                connection, operation_id, None, status, "OPERATION_CREATED",
+                "system", "gateway",
+                "Policy approved the action." if decision.allowed else "Policy denied the action.",
+                timestamp,
+            )
             connection.commit()
             return self._gateway_operation(row)
         except Exception:
@@ -456,12 +518,19 @@ class SQLitePolicyStore:
             if not stored_hash or not hmac.compare_digest(stored_hash, supplied_hash):
                 connection.commit()
                 return None
+            timestamp = datetime.now(timezone.utc).isoformat()
             cursor = connection.execute(
                 """UPDATE gateway_operations
                 SET status = 'EXECUTING', updated_at = ?
                 WHERE operation_id = ? AND status = 'APPROVED'""",
-                (datetime.now(timezone.utc).isoformat(), operation_id),
+                (timestamp, operation_id),
             )
+            if cursor.rowcount == 1:
+                self._insert_gateway_event(
+                    connection, operation_id, "APPROVED", "EXECUTING",
+                    "EXECUTION_CLAIMED", "system", "gateway",
+                    "Gateway atomically claimed the operation for execution.", timestamp,
+                )
             connection.commit()
             return cursor.rowcount == 1
         except Exception:
@@ -485,17 +554,24 @@ class SQLitePolicyStore:
         connection = self._connect()
         try:
             with connection:
+                timestamp = datetime.now(timezone.utc).isoformat()
                 cursor = connection.execute(
                     """UPDATE gateway_operations
                     SET status = ?, result = ?, updated_at = ?
                     WHERE operation_id = ? AND status = 'EXECUTING'""",
-                    (
-                        status,
-                        result,
-                        datetime.now(timezone.utc).isoformat(),
-                        operation_id,
-                    ),
+                    (status, result, timestamp, operation_id),
                 )
+                if cursor.rowcount == 1:
+                    safe_reason = (
+                        "Executor completed successfully." if status == "SUCCEEDED"
+                        else "Executor reported a failure." if status == "FAILED"
+                        else "Execution outcome is uncertain."
+                    )
+                    self._insert_gateway_event(
+                        connection, operation_id, "EXECUTING", status,
+                        "EXECUTION_COMPLETED", "system", "gateway",
+                        safe_reason, timestamp,
+                    )
                 return cursor.rowcount == 1
         finally:
             connection.close()
@@ -516,12 +592,74 @@ class SQLitePolicyStore:
             connection.close()
         return None if row is None else self._gateway_operation(row)
 
-    def mark_gateway_operation_unknown(self, operation_id: str) -> bool:
-        """Explicitly mark an unresolved EXECUTING operation as UNKNOWN.
+    def get_gateway_operation_by_id(self, operation_id: str) -> dict[str, object] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM gateway_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else self._gateway_operation(row)
 
-        This does not authorize another execution attempt.
-        """
-        return self.complete_gateway_operation(operation_id, "UNKNOWN")
+    def list_gateway_operation_events(self, operation_id: str) -> list[dict[str, object]] | None:
+        connection = self._connect()
+        try:
+            exists = connection.execute(
+                "SELECT 1 FROM gateway_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if exists is None:
+                return None
+            rows = connection.execute(
+                """SELECT event_id, operation_id, previous_status, new_status,
+                          event_type, actor_type, actor_id, reason, created_at
+                FROM gateway_operation_events
+                WHERE operation_id = ? ORDER BY event_id""",
+                (operation_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [dict(row) for row in rows]
+
+    def reconcile_gateway_operation_unknown(
+        self, operation_id: str, actor_id: str, reason: str
+    ) -> bool:
+        if not isinstance(actor_id, str) or not actor_id.strip() or len(actor_id) > 100:
+            raise ValueError("Audit actor_id must contain 1-100 non-whitespace characters.")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise ValueError("Reconciliation reason must contain 1-500 non-whitespace characters.")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            timestamp = datetime.now(timezone.utc).isoformat()
+            cursor = connection.execute(
+                """UPDATE gateway_operations
+                SET status = 'UNKNOWN', result = ?, updated_at = ?
+                WHERE operation_id = ? AND status = 'EXECUTING'""",
+                ("Manually reconciled; outcome remains unknown.", timestamp, operation_id),
+            )
+            if cursor.rowcount == 1:
+                self._insert_gateway_event(
+                    connection, operation_id, "EXECUTING", "UNKNOWN",
+                    "MANUAL_RECONCILIATION", "owner", actor_id,
+                    reason.strip(), timestamp,
+                )
+            connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_gateway_operation_unknown(self, operation_id: str) -> bool:
+        """Backward-compatible trusted-internal helper."""
+        return self.reconcile_gateway_operation_unknown(
+            operation_id, "legacy-internal", "Legacy internal reconciliation."
+        )
 
     def _evaluate_and_reserve(
         self,
