@@ -474,3 +474,73 @@ def test_expired_leases_are_rejected_after_waiting_for_write_lock(tmp_path, monk
         assert current["status"] == "APPROVED"
         assert current["reservation_status"] == "RESERVED"
         assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
+
+def test_worker_completion_racing_stale_recovery_has_one_terminal_winner(tmp_path):
+    store, _, _, _, operation = setup_operation(tmp_path)
+    operation_id = operation["operation_id"]
+    claim = store.claim_execution_job("worker-race", lease_seconds=30)
+    assert claim is not None
+    assert store.start_execution_job(
+        operation_id, "worker-race", claim["fencing_token"]
+    ) is True
+
+    reference_time = datetime.now(timezone.utc)
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_operations SET updated_at = ? WHERE operation_id = ?",
+            ((reference_time - timedelta(minutes=5)).isoformat(), operation_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    start = Event()
+
+    def complete():
+        start.wait()
+        return store.complete_execution_job(
+            operation_id,
+            "worker-race",
+            claim["fencing_token"],
+            "SUCCEEDED",
+            "Execution completed.",
+        )
+
+    def recover():
+        start.wait()
+        return store.recover_stale_gateway_operations(
+            60,
+            now=reference_time,
+            reason="Worker completion raced stale recovery.",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        completion = pool.submit(complete)
+        recovery = pool.submit(recover)
+        start.set()
+        completed = completion.result()
+        recovered_ids = recovery.result()
+
+    final = store.get_gateway_operation_by_id(operation_id)
+    job_status = store.get_gateway_execution_status(operation_id)
+    events = store.list_gateway_operation_events(operation_id)
+
+    assert (
+        final["status"] == "SUCCEEDED"
+        and completed is True
+        and recovered_ids == []
+        and job_status == "COMPLETED"
+        and final["reservation_status"] == "SETTLED"
+    ) or (
+        final["status"] == "UNKNOWN"
+        and completed is False
+        and recovered_ids == [operation_id]
+        and job_status == "UNKNOWN"
+        and final["reservation_status"] == "RESERVED"
+    )
+    assert sum(
+        event["event_type"] == "EXECUTION_COMPLETED" for event in events
+    ) + sum(
+        event["event_type"] == "STALE_OPERATION_RECOVERY" for event in events
+    ) == 1
