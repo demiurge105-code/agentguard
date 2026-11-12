@@ -544,3 +544,111 @@ def test_worker_completion_racing_stale_recovery_has_one_terminal_winner(tmp_pat
     ) + sum(
         event["event_type"] == "STALE_OPERATION_RECOVERY" for event in events
     ) == 1
+
+
+
+def test_token_rotation_cancels_queued_job_and_releases_reservation(tmp_path):
+    store, policy_id, _, _, operation = setup_operation(tmp_path)
+    new_token = "replacement-worker-secret"
+
+    assert store.rotate_agent_token(
+        policy_id, hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+    ) is True
+
+    final = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert final["status"] == "CANCELLED"
+    assert final["reservation_status"] == "RELEASED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "CANCELLED"
+    assert store.claim_execution_job("worker-after-rotation") is None
+
+    events = store.list_gateway_operation_events(operation["operation_id"])
+    assert [event["event_type"] for event in events][-2:] == [
+        "TOKEN_ROTATION_CANCELLED",
+        "RESERVATION_RELEASED",
+    ]
+
+
+def test_token_rotation_fences_leased_worker_before_dispatch(tmp_path):
+    store, policy_id, _, _, operation = setup_operation(tmp_path)
+    claim = store.claim_execution_job("worker-leased")
+    assert claim is not None
+
+    assert store.rotate_agent_token(
+        policy_id, hashlib.sha256(b"replacement-token").hexdigest()
+    ) is True
+
+    assert store.start_execution_job(
+        operation["operation_id"],
+        "worker-leased",
+        claim["fencing_token"],
+    ) is False
+    final = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert final["status"] == "CANCELLED"
+    assert final["reservation_status"] == "RELEASED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "CANCELLED"
+
+
+def test_token_rotation_preserves_dispatch_started_operation_and_reservation(tmp_path):
+    store, policy_id, _, _, operation = setup_operation(tmp_path)
+    claim = store.claim_execution_job("worker-dispatch")
+    assert claim is not None
+    assert store.start_execution_job(
+        operation["operation_id"], "worker-dispatch", claim["fencing_token"]
+    ) is True
+
+    assert store.rotate_agent_token(
+        policy_id, hashlib.sha256(b"replacement-token").hexdigest()
+    ) is True
+
+    current = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert current["status"] == "EXECUTING"
+    assert current["reservation_status"] == "RESERVED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "DISPATCH_STARTED"
+
+    assert store.complete_execution_job(
+        operation["operation_id"],
+        "worker-dispatch",
+        claim["fencing_token"],
+        "SUCCEEDED",
+        "Completed after token rotation.",
+    ) is True
+    completed = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert completed["status"] == "SUCCEEDED"
+    assert completed["reservation_status"] == "SETTLED"
+
+
+def test_token_rotation_racing_dispatch_has_one_atomic_winner(tmp_path):
+    from threading import Barrier
+
+    store, policy_id, _, _, operation = setup_operation(tmp_path)
+    claim = store.claim_execution_job("worker-racing")
+    assert claim is not None
+    start = Barrier(3)
+    new_hash = hashlib.sha256(b"replacement-token").hexdigest()
+
+    def start_dispatch():
+        start.wait()
+        return store.start_execution_job(
+            operation["operation_id"], "worker-racing", claim["fencing_token"]
+        )
+
+    def rotate():
+        start.wait()
+        return store.rotate_agent_token(policy_id, new_hash)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        dispatch_future = pool.submit(start_dispatch)
+        rotation_future = pool.submit(rotate)
+        start.wait()
+        dispatch_started = dispatch_future.result()
+        assert rotation_future.result() is True
+
+    final = store.get_gateway_operation_by_id(operation["operation_id"])
+    if dispatch_started:
+        assert final["status"] == "EXECUTING"
+        assert final["reservation_status"] == "RESERVED"
+        assert store.get_gateway_execution_status(operation["operation_id"]) == "DISPATCH_STARTED"
+    else:
+        assert final["status"] == "CANCELLED"
+        assert final["reservation_status"] == "RELEASED"
+        assert store.get_gateway_execution_status(operation["operation_id"]) == "CANCELLED"
