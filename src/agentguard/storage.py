@@ -635,7 +635,7 @@ class SQLitePolicyStore:
             row = connection.execute(
                 """SELECT operations.policy_id, operations.status,
                           jobs.status AS job_status, jobs.worker_id,
-                          jobs.fencing_token
+                          jobs.fencing_token, jobs.lease_expires_at
                 FROM gateway_operations AS operations
                 JOIN gateway_execution_jobs AS jobs
                   ON jobs.operation_id = operations.operation_id
@@ -648,6 +648,8 @@ class SQLitePolicyStore:
                 or row["job_status"] != "LEASED"
                 or row["worker_id"] != worker_id
                 or row["fencing_token"] != fencing_token
+                or not row["lease_expires_at"]
+                or row["lease_expires_at"] <= timestamp
             ):
                 connection.commit()
                 return False
@@ -657,8 +659,9 @@ class SQLitePolicyStore:
                 SET status = 'COMPLETED', worker_id = NULL,
                     lease_expires_at = NULL, updated_at = ?
                 WHERE operation_id = ? AND status = 'LEASED'
-                  AND worker_id = ? AND fencing_token = ?""",
-                (timestamp, operation_id, worker_id, fencing_token),
+                  AND worker_id = ? AND fencing_token = ?
+                  AND lease_expires_at > ?""",
+                (timestamp, operation_id, worker_id, fencing_token, timestamp),
             )
             if job_cursor.rowcount != 1:
                 connection.commit()
