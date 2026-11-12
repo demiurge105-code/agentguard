@@ -727,20 +727,26 @@ class SQLitePolicyStore:
             raise ValueError("worker_id must contain 1-100 non-whitespace characters without surrounding whitespace.")
         if type(lease_seconds) is not int or not 5 <= lease_seconds <= 300:
             raise ValueError("lease_seconds must be an integer between 5 and 300.")
-        reference_time = now or datetime.now(timezone.utc)
-        if (
+        reference_time = now
+        if reference_time is not None and (
             not isinstance(reference_time, datetime)
             or reference_time.tzinfo is None
             or reference_time.utcoffset() is None
         ):
             raise ValueError("now must be a timezone-aware datetime.")
-        timestamp_dt = reference_time.astimezone(timezone.utc)
-        timestamp = timestamp_dt.isoformat()
-        lease_expires_at = (timestamp_dt + timedelta(seconds=lease_seconds)).isoformat()
 
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # For real-time claims, start the lease only after acquiring the
+            # write lock. Lock contention must not consume the worker's lease.
+            timestamp_dt = (
+                reference_time or datetime.now(timezone.utc)
+            ).astimezone(timezone.utc)
+            timestamp = timestamp_dt.isoformat()
+            lease_expires_at = (
+                timestamp_dt + timedelta(seconds=lease_seconds)
+            ).isoformat()
             row = connection.execute(
                 """SELECT jobs.operation_id, jobs.fencing_token,
                           operations.canonical_intent, operations.policy_id,
