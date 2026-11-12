@@ -460,16 +460,21 @@ class SQLitePolicyStore:
         ):
             raise ValueError("idempotency_key must be 1-200 non-whitespace characters.")
 
-        utc_day = (
-            (now or datetime.now(timezone.utc))
-            .astimezone(timezone.utc)
-            .date()
-            .isoformat()
-        )
-        timestamp = datetime.now(timezone.utc).isoformat()
+        if now is not None and (
+            not isinstance(now, datetime)
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            raise ValueError("now must be a timezone-aware datetime.")
+
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # The reservation day is the day the serialized reservation is
+            # created, not the time before waiting for SQLite's write lock.
+            reference_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            utc_day = reference_time.date().isoformat()
+            timestamp = reference_time.isoformat()
             policy_row = connection.execute(
                 """SELECT max_transaction, daily_limit, allowed_recipients, chain_id,
                           agent_token_hash
@@ -1370,15 +1375,20 @@ class SQLitePolicyStore:
                 "amount must be a Decimal or decimal string, not a float."
             )
         transaction_amount = Decimal(amount)
-        utc_day = (
-            (now or datetime.now(timezone.utc))
-            .astimezone(timezone.utc)
-            .date()
-            .isoformat()
-        )
+        if now is not None and (
+            not isinstance(now, datetime)
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            raise ValueError("now must be a timezone-aware datetime.")
+
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # Sample real time only after acquiring the write lock so a
+            # request blocked across UTC midnight is charged to its commit day.
+            reference_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            utc_day = reference_time.date().isoformat()
             policy_row = connection.execute(
                 """SELECT max_transaction, daily_limit, allowed_recipients, chain_id,
                           agent_token_hash
