@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 from threading import Event
 import pytest
 from agentguard.intent import ActionIntent
@@ -801,7 +802,7 @@ def test_reservation_day_is_sampled_after_acquiring_write_lock(
     import agentguard.storage as storage_module
 
     token = "cross-midnight-agent-token"
-    token_hash = __import__("hashlib").sha256(token.encode("utf-8")).hexdigest()
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     store = SQLitePolicyStore(tmp_path / f"{reservation_path}.db")
     policy_id = store.create_policy(make_policy("100"), token_hash)
     intent = ActionIntent(policy_id, "10", "Alice")
