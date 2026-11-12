@@ -235,8 +235,6 @@ def test_unsupported_worker_output_is_unknown_and_not_persisted(tmp_path):
 
 
 def test_worker_rejects_malformed_intent_without_dispatch_and_continues_queue(tmp_path):
-    import json
-
     store, _, _, _, malformed = setup_operation(tmp_path)
     token = "worker-agent-secret"
     policy_id = store.create_policy(
@@ -291,9 +289,7 @@ def test_worker_rejects_non_object_and_unsupported_intent_versions(tmp_path):
     import json
     import pytest
 
-    store, _, _, _, operation = setup_operation(tmp_path)
-    claim = store.claim_execution_job("worker-a")
-    assert claim is not None
+    _, _, _, _, operation = setup_operation(tmp_path)
 
     with pytest.raises(ValueError, match="object shape"):
         ExecutionWorker._load_intent("[]")
