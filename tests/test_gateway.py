@@ -167,8 +167,12 @@ def test_token_revoked_between_reservation_and_claim_blocks_execution(tmp_path):
     )
     result = gateway.submit(intent, new_token, "revoke-before-claim")
 
-    assert result.status is OperationStatus.SUCCEEDED
-    assert len(calls) == 1
+    # The idempotency key is already bound to the cancelled operation.
+    # A retry with the rotated token must return that terminal result,
+    # not create a replacement operation or invoke the executor.
+    assert result.status is OperationStatus.CANCELLED
+    assert result.operation_id == record["operation_id"]
+    assert calls == []
 
 
 def test_revoked_token_cannot_replay_existing_operation(tmp_path):
