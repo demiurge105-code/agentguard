@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+import time
 from datetime import datetime, timedelta, timezone
 import hashlib
 
@@ -365,3 +367,71 @@ def test_pre_dispatch_failure_rejects_expired_lease_even_before_reclaim(tmp_path
     assert current["status"] == "APPROVED"
     assert current["reservation_status"] == "RESERVED"
     assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
+
+
+
+def test_expired_leases_are_rejected_after_waiting_for_write_lock(tmp_path, monkeypatch):
+    store, policy_id, token, _, first_operation = setup_operation(tmp_path)
+    second_operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "12", "Alice"), token, "worker-key-second"
+    )
+    assert second_operation is not None
+
+    base = datetime.now(timezone.utc)
+    dispatch_lease = store.claim_execution_job(
+        "worker-dispatch", lease_seconds=5, now=base
+    )
+    failure_lease = store.claim_execution_job(
+        "worker-failure", lease_seconds=5, now=base
+    )
+    assert dispatch_lease is not None and failure_lease is not None
+    assert dispatch_lease["operation_id"] == first_operation["operation_id"]
+    assert failure_lease["operation_id"] == second_operation["operation_id"]
+
+    original_connect = store._connect
+    lock_connection = original_connect()
+    lock_connection.execute("BEGIN IMMEDIATE")
+
+    connected = 0
+    connected_lock = Lock()
+    both_workers_connected = Event()
+
+    def tracked_connect():
+        nonlocal connected
+        connection = original_connect()
+        with connected_lock:
+            connected += 1
+            if connected == 2:
+                both_workers_connected.set()
+        return connection
+
+    monkeypatch.setattr(store, "_connect", tracked_connect)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        dispatch_future = pool.submit(
+            store.start_execution_job,
+            first_operation["operation_id"],
+            "worker-dispatch",
+            dispatch_lease["fencing_token"],
+        )
+        failure_future = pool.submit(
+            store.fail_pre_dispatch_validation,
+            second_operation["operation_id"],
+            "worker-failure",
+            failure_lease["fencing_token"],
+        )
+
+        assert both_workers_connected.wait(timeout=3)
+        # Both methods have sampled their pre-lock state and are waiting for
+        # BEGIN IMMEDIATE. The five-second leases expire while the lock is held.
+        time.sleep(5.2)
+        lock_connection.commit()
+
+        assert dispatch_future.result(timeout=10) is False
+        assert failure_future.result(timeout=10) is False
+
+    lock_connection.close()
+    for operation in (first_operation, second_operation):
+        current = store.get_gateway_operation_by_id(operation["operation_id"])
+        assert current["status"] == "APPROVED"
+        assert current["reservation_status"] == "RESERVED"
+        assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
