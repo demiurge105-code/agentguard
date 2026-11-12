@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
+import sqlite3
 import hashlib
 from threading import Event
 import pytest
@@ -881,3 +882,58 @@ def test_reservation_day_is_sampled_after_acquiring_write_lock(
         connection.close()
 
     assert row["utc_day"] == "2026-11-04"
+
+
+
+def test_foreign_keys_are_enabled_and_enforced_on_each_connection(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "foreign-keys.db")
+
+    connection = store._connect()
+    try:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO daily_reservations (
+                    policy_id, request_id, utc_day, amount, recipient,
+                    allowed, reason_code, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("missing-policy", "request-1", "2026-11-12", "1", "Alice", 1, "ALLOW", "Allowed"),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO gateway_operations (
+                    operation_id, policy_id, idempotency_key, canonical_intent,
+                    status, allowed, reason_code, reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("missing-operation", "missing-policy", "key-1", "{}", "APPROVED", 1,
+                 "ALLOW", "Allowed", "2026-11-12T00:00:00+00:00", "2026-11-12T00:00:00+00:00"),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO gateway_operation_events (
+                    operation_id, new_status, event_type, actor_type,
+                    actor_id, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ("missing-operation", "APPROVED", "TEST", "SYSTEM", "test", "test",
+                 "2026-11-12T00:00:00+00:00"),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO gateway_execution_jobs (
+                    operation_id, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?)""",
+                ("missing-operation", "QUEUED", "2026-11-12T00:00:00+00:00",
+                 "2026-11-12T00:00:00+00:00"),
+            )
+    finally:
+        connection.close()
+
+    second_connection = store._connect()
+    try:
+        assert second_connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    finally:
+        second_connection.close()
