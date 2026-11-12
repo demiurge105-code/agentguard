@@ -76,6 +76,45 @@ def test_only_one_concurrent_worker_can_lease_a_queued_job(tmp_path):
     assert successful[0]["operation_id"] == operation["operation_id"]
 
 
+def test_claim_lease_starts_after_acquiring_write_lock(tmp_path, monkeypatch):
+    store, _, _, _, operation = setup_operation(tmp_path)
+    original_connect = store._connect
+    lock_connection = original_connect()
+    lock_connection.execute("BEGIN IMMEDIATE")
+
+    connected = Event()
+
+    def tracked_connect():
+        connection = original_connect()
+        connected.set()
+        return connection
+
+    monkeypatch.setattr(store, "_connect", tracked_connect)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            claim_future = pool.submit(
+                store.claim_execution_job,
+                "worker-delayed",
+                lease_seconds=5,
+            )
+            assert connected.wait(timeout=3)
+            # The claim is blocked on BEGIN IMMEDIATE for longer than its lease.
+            time.sleep(5.2)
+            lock_connection.commit()
+            claim = claim_future.result(timeout=10)
+    finally:
+        if lock_connection.in_transaction:
+            lock_connection.rollback()
+        lock_connection.close()
+
+    assert claim is not None
+    assert claim["operation_id"] == operation["operation_id"]
+    lease_expiry = datetime.fromisoformat(claim["lease_expires_at"])
+    assert lease_expiry > datetime.now(timezone.utc) + timedelta(seconds=3)
+    # A second worker must not be able to reclaim the newly issued lease.
+    assert store.claim_execution_job("worker-second", lease_seconds=5) is None
+
+
 def test_expired_pre_dispatch_lease_can_be_reclaimed_with_new_fence(tmp_path):
     store, _, _, _, operation = setup_operation(tmp_path)
     base = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
