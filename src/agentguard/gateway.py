@@ -17,6 +17,7 @@ class OperationStatus(str, Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     UNKNOWN = "UNKNOWN"
+    CANCELLED = "CANCELLED"
 
 
 class GatewayAuthenticationError(PermissionError):
