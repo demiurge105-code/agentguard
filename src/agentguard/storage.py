@@ -1159,11 +1159,7 @@ class SQLitePolicyStore:
                 WHERE gateway_operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
-            if (
-                row is None
-                or row["status"] != "APPROVED"
-                or (row["job_status"] is not None and row["job_status"] != "QUEUED")
-            ):
+            if row is None:
                 connection.commit()
                 return False
             supplied_hash = hashlib.sha256(agent_token.encode("utf-8")).hexdigest()
@@ -1171,6 +1167,12 @@ class SQLitePolicyStore:
             if not stored_hash or not hmac.compare_digest(stored_hash, supplied_hash):
                 connection.commit()
                 return None
+            if (
+                row["status"] != "APPROVED"
+                or (row["job_status"] is not None and row["job_status"] != "QUEUED")
+            ):
+                connection.commit()
+                return False
             timestamp = datetime.now(timezone.utc).isoformat()
             cursor = connection.execute(
                 """UPDATE gateway_operations
