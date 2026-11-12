@@ -605,6 +605,111 @@ class SQLitePolicyStore:
             connection.close()
 
 
+    def fail_pre_dispatch_validation(
+        self,
+        operation_id: str,
+        worker_id: str,
+        fencing_token: int,
+    ) -> bool:
+        """Fail a malformed job only while this worker still owns its pre-dispatch lease.
+
+        This transition is safe because the executor has not been invoked. The
+        operation, job, reservation, and audit event are updated atomically.
+        """
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string.")
+        if (
+            not isinstance(worker_id, str)
+            or not worker_id
+            or worker_id.strip() != worker_id
+            or len(worker_id) > 100
+        ):
+            raise ValueError("worker_id must contain 1-100 non-whitespace characters without surrounding whitespace.")
+        if type(fencing_token) is not int or fencing_token < 1:
+            raise ValueError("fencing_token must be a positive integer.")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            # Sample time only after acquiring the write lock. Otherwise a long
+            # lock wait can make an expired lease appear valid.
+            timestamp = datetime.now(timezone.utc).isoformat()
+            row = connection.execute(
+                """SELECT operations.policy_id, operations.status,
+                          jobs.status AS job_status, jobs.worker_id,
+                          jobs.fencing_token, jobs.lease_expires_at
+                FROM gateway_operations AS operations
+                JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = operations.operation_id
+                WHERE operations.operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "APPROVED"
+                or row["job_status"] != "LEASED"
+                or row["worker_id"] != worker_id
+                or row["fencing_token"] != fencing_token
+                or not row["lease_expires_at"]
+                or row["lease_expires_at"] <= timestamp
+            ):
+                connection.commit()
+                return False
+
+            job_cursor = connection.execute(
+                """UPDATE gateway_execution_jobs
+                SET status = 'COMPLETED', worker_id = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE operation_id = ? AND status = 'LEASED'
+                  AND worker_id = ? AND fencing_token = ?
+                  AND lease_expires_at > ?""",
+                (timestamp, operation_id, worker_id, fencing_token, timestamp),
+            )
+            if job_cursor.rowcount != 1:
+                connection.commit()
+                return False
+
+            operation_cursor = connection.execute(
+                """UPDATE gateway_operations
+                SET status = 'FAILED',
+                    result = 'Pre-dispatch intent validation failed; executor was not started.',
+                    updated_at = ?
+                WHERE operation_id = ? AND status = 'APPROVED'""",
+                (timestamp, operation_id),
+            )
+            if operation_cursor.rowcount != 1:
+                raise RuntimeError("Gateway operation changed while rejecting malformed intent.")
+
+            reservation = connection.execute(
+                """UPDATE daily_reservations
+                SET reservation_status = 'RELEASED'
+                WHERE policy_id = ? AND request_id = ?
+                  AND allowed = 1 AND reservation_status = 'RESERVED'""",
+                (row["policy_id"], f"gateway:{operation_id}"),
+            )
+            if reservation.rowcount != 1:
+                raise RuntimeError("Malformed gateway operation has no active budget reservation to release.")
+
+            self._insert_gateway_event(
+                connection,
+                operation_id,
+                "APPROVED",
+                "FAILED",
+                "PRE_DISPATCH_VALIDATION_FAILED",
+                "worker",
+                worker_id,
+                "Canonical action intent failed validation; executor was not started.",
+                timestamp,
+            )
+            connection.commit()
+            return True
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def claim_execution_job(
         self,
         worker_id: str,
@@ -706,14 +811,22 @@ class SQLitePolicyStore:
             raise ValueError("worker_id must contain 1-100 non-whitespace characters.")
         if type(fencing_token) is not int or fencing_token < 1:
             raise ValueError("fencing_token must be a positive integer.")
-        reference_time = now or datetime.now(timezone.utc)
-        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
-            raise ValueError("now must be timezone-aware.")
-        timestamp = reference_time.astimezone(timezone.utc).isoformat()
+        reference_time = now
+        if reference_time is not None and (
+            not isinstance(reference_time, datetime)
+            or reference_time.tzinfo is None
+            or reference_time.utcoffset() is None
+        ):
+            raise ValueError("now must be a timezone-aware datetime.")
 
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # For real-time calls, sample time after acquiring the write lock
+            # so lock contention cannot extend a worker's lease.
+            timestamp = (
+                reference_time or datetime.now(timezone.utc)
+            ).astimezone(timezone.utc).isoformat()
             job = connection.execute(
                 """SELECT status, worker_id, fencing_token, lease_expires_at
                 FROM gateway_execution_jobs WHERE operation_id = ?""",

@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+import time
 from datetime import datetime, timedelta, timezone
 import hashlib
 
@@ -231,3 +233,205 @@ def test_unsupported_worker_output_is_unknown_and_not_persisted(tmp_path):
     final = store.get_gateway_operation_by_id(operation["operation_id"])
     assert final["status"] == "UNKNOWN"
     assert "must-not-be-persisted" not in (final["result"] or "")
+
+
+
+def test_worker_rejects_malformed_intent_without_dispatch_and_continues_queue(tmp_path):
+    store, _, _, _, malformed = setup_operation(tmp_path)
+    token = "worker-agent-secret"
+    policy_id = store.create_policy(
+        Policy("100", "100", ["Alice"]),
+        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    )
+    valid = store.begin_gateway_operation(
+        ActionIntent(policy_id, "11", "Alice"), token, "worker-key-valid"
+    )
+    assert valid is not None
+
+    # Make the malformed operation deterministically older so it is claimed first.
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_operations SET canonical_intent = ? WHERE operation_id = ?",
+            ("{not-json", malformed["operation_id"]),
+        )
+        connection.execute(
+            "UPDATE gateway_operations SET created_at = '2000-01-01T00:00:00+00:00' WHERE operation_id = ?",
+            (malformed["operation_id"],),
+        )
+        connection.execute(
+            "UPDATE gateway_execution_jobs SET created_at = '2000-01-01T00:00:00+00:00' WHERE operation_id = ?",
+            (malformed["operation_id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    calls = []
+    worker = ExecutionWorker(
+        store,
+        lambda intent, operation_id: calls.append(operation_id),
+        "worker-a",
+    )
+
+    assert worker.run_once() == malformed["operation_id"]
+    rejected = store.get_gateway_operation_by_id(malformed["operation_id"])
+    assert rejected["status"] == "FAILED"
+    assert rejected["reservation_status"] == "RELEASED"
+    assert store.get_gateway_execution_status(malformed["operation_id"]) == "COMPLETED"
+    events = store.list_gateway_operation_events(malformed["operation_id"])
+    assert events[-1]["event_type"] == "PRE_DISPATCH_VALIDATION_FAILED"
+    assert calls == []
+
+    assert worker.run_once() == valid["operation_id"]
+    assert calls == [valid["operation_id"]]
+
+
+def test_worker_rejects_non_object_and_unsupported_intent_versions(tmp_path):
+    import json
+    import pytest
+
+    _, _, _, _, operation = setup_operation(tmp_path)
+
+    with pytest.raises(ValueError, match="object shape"):
+        ExecutionWorker._load_intent("[]")
+
+    payload = json.loads(operation["canonical_intent"])
+    payload["version"] = 2
+    with pytest.raises(ValueError, match="version"):
+        ExecutionWorker._load_intent(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def test_worker_rejects_invalid_intent_field_types_and_noncanonical_json(tmp_path):
+    import json
+    import pytest
+
+    store, _, _, _, operation = setup_operation(tmp_path)
+    payload = json.loads(operation["canonical_intent"])
+
+    wrong_type = dict(payload)
+    wrong_type["amount"] = 10
+    with pytest.raises(ValueError, match="field types"):
+        ExecutionWorker._load_intent(json.dumps(wrong_type, separators=(",", ":"), sort_keys=True))
+
+    missing_field = dict(payload)
+    del missing_field["recipient"]
+    with pytest.raises(ValueError, match="object shape"):
+        ExecutionWorker._load_intent(json.dumps(missing_field, separators=(",", ":"), sort_keys=True))
+
+    noncanonical = json.dumps(payload)
+    with pytest.raises(ValueError, match="canonical representation"):
+        ExecutionWorker._load_intent(noncanonical)
+
+
+def test_pre_dispatch_failure_is_fenced_from_reclaimed_worker(tmp_path):
+    store, _, _, _, operation = setup_operation(tmp_path)
+    base = datetime.now(timezone.utc)
+    first = store.claim_execution_job("worker-old", lease_seconds=5, now=base)
+    second = store.claim_execution_job(
+        "worker-new", lease_seconds=30, now=base + timedelta(seconds=6)
+    )
+    assert first is not None and second is not None
+
+    assert store.fail_pre_dispatch_validation(
+        operation["operation_id"], "worker-old", first["fencing_token"]
+    ) is False
+    current = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert current["status"] == "APPROVED"
+    assert current["reservation_status"] == "RESERVED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
+
+
+def test_pre_dispatch_failure_rejects_expired_lease_even_before_reclaim(tmp_path):
+    store, _, _, _, operation = setup_operation(tmp_path)
+    base = datetime.now(timezone.utc)
+    lease = store.claim_execution_job("worker-a", lease_seconds=5, now=base)
+    assert lease is not None
+
+    # The lease has expired, but no replacement worker has claimed the job yet.
+    # The old worker must not be allowed to fail the operation in this window.
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_execution_jobs SET lease_expires_at = ? WHERE operation_id = ?",
+            ((base - timedelta(seconds=1)).isoformat(), operation["operation_id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert store.fail_pre_dispatch_validation(
+        operation["operation_id"], "worker-a", lease["fencing_token"]
+    ) is False
+    current = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert current["status"] == "APPROVED"
+    assert current["reservation_status"] == "RESERVED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
+
+
+
+def test_expired_leases_are_rejected_after_waiting_for_write_lock(tmp_path, monkeypatch):
+    store, policy_id, token, _, first_operation = setup_operation(tmp_path)
+    second_operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "12", "Alice"), token, "worker-key-second"
+    )
+    assert second_operation is not None
+
+    base = datetime.now(timezone.utc)
+    dispatch_lease = store.claim_execution_job(
+        "worker-dispatch", lease_seconds=5, now=base
+    )
+    failure_lease = store.claim_execution_job(
+        "worker-failure", lease_seconds=5, now=base
+    )
+    assert dispatch_lease is not None and failure_lease is not None
+    assert dispatch_lease["operation_id"] == first_operation["operation_id"]
+    assert failure_lease["operation_id"] == second_operation["operation_id"]
+
+    original_connect = store._connect
+    lock_connection = original_connect()
+    lock_connection.execute("BEGIN IMMEDIATE")
+
+    connected = 0
+    connected_lock = Lock()
+    both_workers_connected = Event()
+
+    def tracked_connect():
+        nonlocal connected
+        connection = original_connect()
+        with connected_lock:
+            connected += 1
+            if connected == 2:
+                both_workers_connected.set()
+        return connection
+
+    monkeypatch.setattr(store, "_connect", tracked_connect)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        dispatch_future = pool.submit(
+            store.start_execution_job,
+            first_operation["operation_id"],
+            "worker-dispatch",
+            dispatch_lease["fencing_token"],
+        )
+        failure_future = pool.submit(
+            store.fail_pre_dispatch_validation,
+            second_operation["operation_id"],
+            "worker-failure",
+            failure_lease["fencing_token"],
+        )
+
+        assert both_workers_connected.wait(timeout=3)
+        # Both methods are waiting for BEGIN IMMEDIATE. The five-second leases
+        # expire while the write lock is held.
+        time.sleep(5.2)
+        lock_connection.commit()
+
+        assert dispatch_future.result(timeout=10) is False
+        assert failure_future.result(timeout=10) is False
+
+    lock_connection.close()
+    for operation in (first_operation, second_operation):
+        current = store.get_gateway_operation_by_id(operation["operation_id"])
+        assert current["status"] == "APPROVED"
+        assert current["reservation_status"] == "RESERVED"
+        assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"

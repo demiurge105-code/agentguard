@@ -52,6 +52,49 @@ class ExecutionWorker:
         self._worker_id = worker_id
         self._lease_seconds = lease_seconds
 
+    @staticmethod
+    def _load_intent(canonical_intent: object) -> ActionIntent:
+        """Parse and validate the exact canonical v1 intent before dispatch."""
+        if not isinstance(canonical_intent, str):
+            raise ValueError("Canonical intent must be a string.")
+
+        try:
+            payload = json.loads(canonical_intent)
+        except (json.JSONDecodeError, RecursionError) as error:
+            raise ValueError("Canonical intent is not valid JSON.") from error
+
+        expected_fields = {"amount", "chain_id", "policy_id", "recipient", "version"}
+        if type(payload) is not dict or set(payload) != expected_fields:
+            raise ValueError("Canonical intent has an invalid object shape.")
+        if type(payload["version"]) is not int or payload["version"] != 1:
+            raise ValueError("Canonical intent version is unsupported.")
+        if (
+            not isinstance(payload["policy_id"], str)
+            or not isinstance(payload["amount"], str)
+            or not isinstance(payload["recipient"], str)
+            or (
+                payload["chain_id"] is not None
+                and not isinstance(payload["chain_id"], str)
+            )
+        ):
+            raise ValueError("Canonical intent contains invalid field types.")
+
+        try:
+            intent = ActionIntent(
+                payload["policy_id"],
+                payload["amount"],
+                payload["recipient"],
+                chain_id=payload["chain_id"],
+            )
+        except (TypeError, ValueError, KeyError) as error:
+            raise ValueError("Canonical intent failed ActionIntent validation.") from error
+
+        # Reject duplicate JSON keys, alternate encodings, and any payload that
+        # does not exactly match the canonical representation stored at creation.
+        if intent.canonical_json != canonical_intent:
+            raise ValueError("Canonical intent does not match its canonical representation.")
+        return intent
+
     def run_once(self) -> str | None:
         """Process one available job and return its operation ID, if any."""
         job = self._store.claim_execution_job(
@@ -63,13 +106,15 @@ class ExecutionWorker:
 
         operation_id = str(job["operation_id"])
         fencing_token = int(job["fencing_token"])
-        payload = json.loads(str(job["canonical_intent"]))
-        intent = ActionIntent(
-            str(payload["policy_id"]),
-            str(payload["amount"]),
-            str(payload["recipient"]),
-            chain_id=payload["chain_id"],
-        )
+        try:
+            intent = self._load_intent(job["canonical_intent"])
+        except ValueError:
+            rejected = self._store.fail_pre_dispatch_validation(
+                operation_id,
+                self._worker_id,
+                fencing_token,
+            )
+            return operation_id if rejected else None
 
         if not self._store.start_execution_job(
             operation_id,
