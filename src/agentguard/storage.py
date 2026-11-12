@@ -137,7 +137,7 @@ class SQLitePolicyStore:
                     """CREATE TABLE IF NOT EXISTS gateway_execution_jobs (
                         operation_id TEXT PRIMARY KEY,
                         status TEXT NOT NULL CHECK (status IN (
-                            'QUEUED', 'LEASED', 'DISPATCH_STARTED', 'COMPLETED', 'UNKNOWN'
+                            'QUEUED', 'LEASED', 'DISPATCH_STARTED', 'COMPLETED', 'UNKNOWN', 'CANCELLED'
                         )),
                         fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
                         worker_id TEXT,
@@ -151,6 +151,50 @@ class SQLitePolicyStore:
                     """CREATE INDEX IF NOT EXISTS idx_gateway_execution_jobs_claim
                     ON gateway_execution_jobs(status, lease_expires_at, created_at)"""
                 )
+                # Older databases have a CHECK constraint that predates CANCELLED.
+                # Rebuild this leaf table transactionally; no table references it.
+                job_table = connection.execute(
+                    """SELECT sql FROM sqlite_master
+                    WHERE type = 'table' AND name = 'gateway_execution_jobs'"""
+                ).fetchone()
+                if job_table is not None and "'CANCELLED'" not in job_table["sql"]:
+                    # DDL is not guaranteed to start a transaction in sqlite3's
+                    # legacy transaction mode. Begin explicitly before creating
+                    # the replacement table so every migration step rolls back
+                    # together if copying or rebuilding fails.
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        """CREATE TABLE gateway_execution_jobs_new (
+                            operation_id TEXT PRIMARY KEY,
+                            status TEXT NOT NULL CHECK (status IN (
+                                'QUEUED', 'LEASED', 'DISPATCH_STARTED',
+                                'COMPLETED', 'UNKNOWN', 'CANCELLED'
+                            )),
+                            fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+                            worker_id TEXT,
+                            lease_expires_at TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            FOREIGN KEY (operation_id) REFERENCES gateway_operations(operation_id)
+                        )"""
+                    )
+                    connection.execute(
+                        """INSERT INTO gateway_execution_jobs_new (
+                            operation_id, status, fencing_token, worker_id,
+                            lease_expires_at, created_at, updated_at
+                        )
+                        SELECT operation_id, status, fencing_token, worker_id,
+                               lease_expires_at, created_at, updated_at
+                        FROM gateway_execution_jobs"""
+                    )
+                    connection.execute("DROP TABLE gateway_execution_jobs")
+                    connection.execute(
+                        "ALTER TABLE gateway_execution_jobs_new RENAME TO gateway_execution_jobs"
+                    )
+                    connection.execute(
+                        """CREATE INDEX idx_gateway_execution_jobs_claim
+                        ON gateway_execution_jobs(status, lease_expires_at, created_at)"""
+                    )
                 reservation_columns = {
                     row["name"]
                     for row in connection.execute(
@@ -278,15 +322,94 @@ class SQLitePolicyStore:
         return hmac.compare_digest(row["agent_token_hash"], supplied_hash)
 
     def rotate_agent_token(self, policy_id: str, token_hash: str) -> bool:
-        """Atomically replace a policy's agent-token hash; return False if absent."""
+        """Rotate credentials and cancel all pre-dispatch queued work atomically.
+
+        QUEUED and LEASED jobs are safe to cancel because the executor has not
+        crossed DISPATCH_STARTED. Incrementing the fencing token invalidates
+        any worker lease that was issued before this transaction.
+        """
         connection = self._connect()
         try:
-            with connection:
-                cursor = connection.execute(
-                    "UPDATE policies SET agent_token_hash = ? WHERE policy_id = ?",
-                    (token_hash, policy_id),
+            connection.execute("BEGIN IMMEDIATE")
+            timestamp = datetime.now(timezone.utc).isoformat()
+            cursor = connection.execute(
+                "UPDATE policies SET agent_token_hash = ? WHERE policy_id = ?",
+                (token_hash, policy_id),
+            )
+            if cursor.rowcount != 1:
+                connection.commit()
+                return False
+
+            pending = connection.execute(
+                """SELECT operations.operation_id, operations.policy_id,
+                          jobs.status AS job_status
+                FROM gateway_operations AS operations
+                JOIN gateway_execution_jobs AS jobs
+                  ON jobs.operation_id = operations.operation_id
+                WHERE operations.policy_id = ?
+                  AND operations.status = 'APPROVED'
+                  AND jobs.status IN ('QUEUED', 'LEASED')
+                ORDER BY operations.created_at, operations.operation_id""",
+                (policy_id,),
+            ).fetchall()
+
+            for row in pending:
+                operation_id = row["operation_id"]
+                job_cursor = connection.execute(
+                    """UPDATE gateway_execution_jobs
+                    SET status = 'CANCELLED',
+                        fencing_token = fencing_token + 1,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE operation_id = ? AND status IN ('QUEUED', 'LEASED')""",
+                    (timestamp, operation_id),
                 )
-                return cursor.rowcount == 1
+                if job_cursor.rowcount != 1:
+                    raise RuntimeError("Queued gateway job changed during token rotation.")
+
+                operation_cursor = connection.execute(
+                    """UPDATE gateway_operations
+                    SET status = 'CANCELLED',
+                        result = 'Cancelled because the agent token was rotated before dispatch.',
+                        updated_at = ?
+                    WHERE operation_id = ? AND policy_id = ? AND status = 'APPROVED'""",
+                    (timestamp, operation_id, policy_id),
+                )
+                if operation_cursor.rowcount != 1:
+                    raise RuntimeError("Gateway operation changed during token rotation.")
+
+                reservation = connection.execute(
+                    """UPDATE daily_reservations
+                    SET reservation_status = 'RELEASED'
+                    WHERE policy_id = ? AND request_id = ?
+                      AND allowed = 1 AND reservation_status = 'RESERVED'""",
+                    (policy_id, f"gateway:{operation_id}"),
+                )
+                if reservation.rowcount != 1:
+                    raise RuntimeError(
+                        "Cancelled gateway operation has no active budget reservation to release."
+                    )
+
+                self._insert_gateway_event(
+                    connection, operation_id, "APPROVED", "CANCELLED",
+                    "TOKEN_ROTATION_CANCELLED", "owner", "token-rotation",
+                    "Owner rotated the agent token before dispatch started; pending execution was cancelled.",
+                    timestamp,
+                )
+                self._insert_gateway_event(
+                    connection, operation_id, "CANCELLED", "CANCELLED",
+                    "RESERVATION_RELEASED", "system", "token-rotation",
+                    "Budget reservation was released because the operation was cancelled before dispatch.",
+                    timestamp,
+                )
+
+            connection.commit()
+            return True
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -1041,11 +1164,7 @@ class SQLitePolicyStore:
                 WHERE gateway_operations.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
-            if (
-                row is None
-                or row["status"] != "APPROVED"
-                or (row["job_status"] is not None and row["job_status"] != "QUEUED")
-            ):
+            if row is None:
                 connection.commit()
                 return False
             supplied_hash = hashlib.sha256(agent_token.encode("utf-8")).hexdigest()
@@ -1053,6 +1172,12 @@ class SQLitePolicyStore:
             if not stored_hash or not hmac.compare_digest(stored_hash, supplied_hash):
                 connection.commit()
                 return None
+            if (
+                row["status"] != "APPROVED"
+                or (row["job_status"] is not None and row["job_status"] != "QUEUED")
+            ):
+                connection.commit()
+                return False
             timestamp = datetime.now(timezone.utc).isoformat()
             cursor = connection.execute(
                 """UPDATE gateway_operations

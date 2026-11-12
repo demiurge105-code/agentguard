@@ -937,3 +937,70 @@ def test_foreign_keys_are_enabled_and_enforced_on_each_connection(tmp_path):
         assert second_connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     finally:
         second_connection.close()
+
+
+
+def test_existing_execution_job_table_migrates_to_support_cancelled(tmp_path):
+    path = tmp_path / "legacy-jobs.db"
+    store = SQLitePolicyStore(path)
+    token = "legacy-agent-token"
+    policy_id = store.create_policy(
+        make_policy("100"),
+        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "legacy-job"
+    )
+    assert operation is not None
+
+    # Recreate the pre-CANCELLED table shape to exercise an actual upgrade.
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP INDEX idx_gateway_execution_jobs_claim")
+        connection.execute(
+            "ALTER TABLE gateway_execution_jobs RENAME TO gateway_execution_jobs_new"
+        )
+        connection.execute(
+            """CREATE TABLE gateway_execution_jobs (
+                operation_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK (status IN (
+                    'QUEUED', 'LEASED', 'DISPATCH_STARTED', 'COMPLETED', 'UNKNOWN'
+                )),
+                fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+                worker_id TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (operation_id) REFERENCES gateway_operations(operation_id)
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO gateway_execution_jobs
+            SELECT operation_id, status, fencing_token, worker_id,
+                   lease_expires_at, created_at, updated_at
+            FROM gateway_execution_jobs_new"""
+        )
+        connection.execute("DROP TABLE gateway_execution_jobs_new")
+        connection.execute(
+            """CREATE INDEX idx_gateway_execution_jobs_claim
+            ON gateway_execution_jobs(status, lease_expires_at, created_at)"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    upgraded = SQLitePolicyStore(path)
+    schema = sqlite3.connect(path)
+    try:
+        table_sql = schema.execute(
+            """SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'gateway_execution_jobs'"""
+        ).fetchone()[0]
+    finally:
+        schema.close()
+
+    assert "'CANCELLED'" in table_sql
+    assert upgraded.rotate_agent_token(
+        policy_id, hashlib.sha256(b"upgraded-token").hexdigest()
+    ) is True
+    assert upgraded.get_gateway_execution_status(operation["operation_id"]) == "CANCELLED"

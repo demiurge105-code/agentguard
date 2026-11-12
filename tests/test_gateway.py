@@ -156,8 +156,10 @@ def test_token_revoked_between_reservation_and_claim_blocks_execution(tmp_path):
         hashlib.sha256(new_token.encode("utf-8")).hexdigest(),
     )
 
+    assert store.authenticate_agent(policy_id, old_token) is False
+    assert store.authenticate_agent(policy_id, new_token) is True
     assert store.claim_gateway_operation(record["operation_id"], old_token) is None
-    assert store.get_gateway_operation(policy_id, "revoke-before-claim")["status"] == "APPROVED"
+    assert store.get_gateway_operation(policy_id, "revoke-before-claim")["status"] == "CANCELLED"
 
     calls = []
     gateway = TrustedExecutionGateway(
@@ -165,8 +167,12 @@ def test_token_revoked_between_reservation_and_claim_blocks_execution(tmp_path):
     )
     result = gateway.submit(intent, new_token, "revoke-before-claim")
 
-    assert result.status is OperationStatus.SUCCEEDED
-    assert len(calls) == 1
+    # The idempotency key is already bound to the cancelled operation.
+    # A retry with the rotated token must return that terminal result,
+    # not create a replacement operation or invoke the executor.
+    assert result.status is OperationStatus.CANCELLED
+    assert result.operation_id == record["operation_id"]
+    assert calls == []
 
 
 def test_revoked_token_cannot_replay_existing_operation(tmp_path):
