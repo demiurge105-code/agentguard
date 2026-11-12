@@ -628,10 +628,12 @@ class SQLitePolicyStore:
         if type(fencing_token) is not int or fencing_token < 1:
             raise ValueError("fencing_token must be a positive integer.")
 
-        timestamp = datetime.now(timezone.utc).isoformat()
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # Sample time only after acquiring the write lock. Otherwise a long
+            # lock wait can make an expired lease appear valid.
+            timestamp = datetime.now(timezone.utc).isoformat()
             row = connection.execute(
                 """SELECT operations.policy_id, operations.status,
                           jobs.status AS job_status, jobs.worker_id,
@@ -809,14 +811,22 @@ class SQLitePolicyStore:
             raise ValueError("worker_id must contain 1-100 non-whitespace characters.")
         if type(fencing_token) is not int or fencing_token < 1:
             raise ValueError("fencing_token must be a positive integer.")
-        reference_time = now or datetime.now(timezone.utc)
-        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
-            raise ValueError("now must be timezone-aware.")
-        timestamp = reference_time.astimezone(timezone.utc).isoformat()
+        reference_time = now
+        if reference_time is not None and (
+            not isinstance(reference_time, datetime)
+            or reference_time.tzinfo is None
+            or reference_time.utcoffset() is None
+        ):
+            raise ValueError("now must be a timezone-aware datetime.")
 
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # For real-time calls, sample time after acquiring the write lock
+            # so lock contention cannot extend a worker's lease.
+            timestamp = (
+                reference_time or datetime.now(timezone.utc)
+            ).astimezone(timezone.utc).isoformat()
             job = connection.execute(
                 """SELECT status, worker_id, fencing_token, lease_expires_at
                 FROM gateway_execution_jobs WHERE operation_id = ?""",
