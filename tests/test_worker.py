@@ -338,3 +338,30 @@ def test_pre_dispatch_failure_is_fenced_from_reclaimed_worker(tmp_path):
     assert current["status"] == "APPROVED"
     assert current["reservation_status"] == "RESERVED"
     assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
+
+
+def test_pre_dispatch_failure_rejects_expired_lease_even_before_reclaim(tmp_path):
+    store, _, _, _, operation = setup_operation(tmp_path)
+    base = datetime.now(timezone.utc)
+    lease = store.claim_execution_job("worker-a", lease_seconds=5, now=base)
+    assert lease is not None
+
+    # The lease has expired, but no replacement worker has claimed the job yet.
+    # The old worker must not be allowed to fail the operation in this window.
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_execution_jobs SET lease_expires_at = ? WHERE operation_id = ?",
+            ((base - timedelta(seconds=1)).isoformat(), operation["operation_id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert store.fail_pre_dispatch_validation(
+        operation["operation_id"], "worker-a", lease["fencing_token"]
+    ) is False
+    current = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert current["status"] == "APPROVED"
+    assert current["reservation_status"] == "RESERVED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
