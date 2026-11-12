@@ -421,8 +421,8 @@ def test_expired_leases_are_rejected_after_waiting_for_write_lock(tmp_path, monk
         )
 
         assert both_workers_connected.wait(timeout=3)
-        # Both methods have sampled their pre-lock state and are waiting for
-        # BEGIN IMMEDIATE. The five-second leases expire while the lock is held.
+        # Both methods are waiting for BEGIN IMMEDIATE. The five-second leases
+        # expire while the write lock is held.
         time.sleep(5.2)
         lock_connection.commit()
 
