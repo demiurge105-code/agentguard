@@ -158,6 +158,11 @@ class SQLitePolicyStore:
                     WHERE type = 'table' AND name = 'gateway_execution_jobs'"""
                 ).fetchone()
                 if job_table is not None and "'CANCELLED'" not in job_table["sql"]:
+                    # DDL is not guaranteed to start a transaction in sqlite3's
+                    # legacy transaction mode. Begin explicitly before creating
+                    # the replacement table so every migration step rolls back
+                    # together if copying or rebuilding fails.
+                    connection.execute("BEGIN IMMEDIATE")
                     connection.execute(
                         """CREATE TABLE gateway_execution_jobs_new (
                             operation_id TEXT PRIMARY KEY,
