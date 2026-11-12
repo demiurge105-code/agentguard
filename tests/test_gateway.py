@@ -156,8 +156,10 @@ def test_token_revoked_between_reservation_and_claim_blocks_execution(tmp_path):
         hashlib.sha256(new_token.encode("utf-8")).hexdigest(),
     )
 
+    assert store.authenticate_agent(policy_id, old_token) is False
+    assert store.authenticate_agent(policy_id, new_token) is True
     assert store.claim_gateway_operation(record["operation_id"], old_token) is None
-    assert store.get_gateway_operation(policy_id, "revoke-before-claim")["status"] == "APPROVED"
+    assert store.get_gateway_operation(policy_id, "revoke-before-claim")["status"] == "CANCELLED"
 
     calls = []
     gateway = TrustedExecutionGateway(
