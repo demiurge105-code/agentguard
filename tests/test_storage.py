@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import Event
 import pytest
 from agentguard.intent import ActionIntent
 from agentguard.policy import DecisionReason, Policy
@@ -791,3 +792,91 @@ def test_worker_migration_backfills_only_legacy_approved_operations(tmp_path):
         ).fetchone()[0] == 1
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("reservation_path", ["legacy", "gateway"])
+def test_reservation_day_is_sampled_after_acquiring_write_lock(
+    tmp_path, monkeypatch, reservation_path
+):
+    import agentguard.storage as storage_module
+
+    token = "cross-midnight-agent-token"
+    token_hash = __import__("hashlib").sha256(token.encode("utf-8")).hexdigest()
+    store = SQLitePolicyStore(tmp_path / f"{reservation_path}.db")
+    policy_id = store.create_policy(make_policy("100"), token_hash)
+    intent = ActionIntent(policy_id, "10", "Alice")
+    original_connect = store._connect
+    lock_connection = original_connect()
+    lock_connection.execute("BEGIN IMMEDIATE")
+    begin_attempted = Event()
+    lock_acquired = Event()
+
+    class LockAwareDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert lock_acquired.is_set(), "clock sampled before BEGIN IMMEDIATE"
+            return datetime(2026, 11, 4, 0, 0, 1, tzinfo=timezone.utc)
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, *args):
+            if sql.strip().upper() == "BEGIN IMMEDIATE":
+                begin_attempted.set()
+            result = self._connection.execute(sql, *args)
+            if sql.strip().upper() == "BEGIN IMMEDIATE":
+                lock_acquired.set()
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def tracked_connect():
+        return ConnectionProxy(original_connect())
+
+    monkeypatch.setattr(store, "_connect", tracked_connect)
+    monkeypatch.setattr(storage_module, "datetime", LockAwareDateTime)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            if reservation_path == "legacy":
+                future = pool.submit(
+                    store.evaluate_and_reserve,
+                    policy_id,
+                    "10",
+                    "Alice",
+                    "cross-midnight",
+                )
+            else:
+                future = pool.submit(
+                    store.begin_gateway_operation,
+                    intent,
+                    token,
+                    "cross-midnight",
+                )
+            assert begin_attempted.wait(timeout=3)
+            lock_connection.commit()
+            result = future.result(timeout=10)
+    finally:
+        if lock_connection.in_transaction:
+            lock_connection.rollback()
+        lock_connection.close()
+
+    if reservation_path == "legacy":
+        assert result is not None and result.allowed
+        request_id = "cross-midnight"
+    else:
+        assert result is not None and result["allowed"]
+        request_id = f"gateway:{result['operation_id']}"
+
+    connection = original_connect()
+    try:
+        row = connection.execute(
+            "SELECT utc_day FROM daily_reservations WHERE policy_id = ? AND request_id = ?",
+            (policy_id, request_id),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row["utc_day"] == "2026-11-04"
