@@ -1004,3 +1004,103 @@ def test_existing_execution_job_table_migrates_to_support_cancelled(tmp_path):
         policy_id, hashlib.sha256(b"upgraded-token").hexdigest()
     ) is True
     assert upgraded.get_gateway_execution_status(operation["operation_id"]) == "CANCELLED"
+
+
+def test_gateway_event_hash_chain_verifies_and_detects_event_tampering(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-tamper.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-tamper"
+    )
+    operation_id = operation["operation_id"]
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is True
+    assert result["event_count"] == 1
+
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_operation_events SET reason = ? WHERE operation_id = ?",
+            ("tampered reason", operation_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "EVENT_HASH_MISMATCH"
+
+
+def test_gateway_event_hash_chain_detects_deleted_middle_event(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-middle.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-middle"
+    )
+    operation_id = operation["operation_id"]
+    assert store.claim_gateway_operation(operation_id, token) is True
+    assert store.complete_gateway_operation(
+        operation_id, "SUCCEEDED", "Execution completed."
+    ) is True
+    events = store.list_gateway_operation_events(operation_id)
+    assert events is not None and len(events) >= 3
+
+    connection = store._connect()
+    try:
+        connection.execute(
+            "DELETE FROM gateway_operation_events WHERE event_id = ?",
+            (events[1]["event_id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "PREVIOUS_HASH_MISMATCH"
+
+
+def test_gateway_event_hash_chain_detects_deleted_tail_event(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-tail.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-tail"
+    )
+    operation_id = operation["operation_id"]
+
+    connection = store._connect()
+    try:
+        event = connection.execute(
+            """SELECT event_id FROM gateway_operation_events
+            WHERE operation_id = ? ORDER BY event_id DESC LIMIT 1""",
+            (operation_id,),
+        ).fetchone()
+        connection.execute(
+            "DELETE FROM gateway_operation_events WHERE event_id = ?",
+            (event["event_id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "EVENT_COUNT_MISMATCH"
