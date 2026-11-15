@@ -380,6 +380,20 @@ def create_app(
             raise HTTPException(status_code=404, detail="Gateway operation not found.")
         return {"operation_id": operation_id, "events": events}
 
+    @application.get("/gateway/operations/{operation_id}/events/verify")
+    def verify_gateway_operation_events(
+        operation_id: str,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> dict[str, object]:
+        require_admin(credentials)
+        try:
+            result = get_store().verify_gateway_operation_events(operation_id)
+        except sqlite3.Error as error:
+            raise HTTPException(status_code=503, detail="Gateway storage is temporarily unavailable.") from error
+        if result is None:
+            raise HTTPException(status_code=404, detail="Gateway operation not found.")
+        return {"operation_id": operation_id, **result}
+
     @application.post("/gateway/operations/recover-stale")
     def recover_stale_gateway_operations(
         data: GatewayStaleRecoveryInput,
