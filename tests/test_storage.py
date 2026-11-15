@@ -362,6 +362,10 @@ def test_gateway_audit_events_record_each_state_transition_atomically(tmp_path):
         (None, "APPROVED"), ("APPROVED", "EXECUTING"),
         ("EXECUTING", "SUCCEEDED"), ("SUCCEEDED", "SUCCEEDED"),
     ]
+    integrity = store.verify_gateway_operation_events(operation["operation_id"])
+    assert integrity is not None
+    assert integrity["valid"] is True
+    assert integrity["event_count"] == 4
 
 
 def test_gateway_audit_insert_failure_rolls_back_operation_and_reservation(tmp_path, monkeypatch):
