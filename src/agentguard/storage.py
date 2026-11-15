@@ -267,21 +267,22 @@ class SQLitePolicyStore:
                         WHERE reservation.request_id LIKE 'gateway:%'"""
                     )
 
-                connection.execute(
-                    """INSERT INTO gateway_operation_events (
-                        operation_id, previous_status, new_status, event_type,
-                        actor_type, actor_id, reason, created_at
-                    )
-                    SELECT operation_id, NULL, status, 'LEGACY_IMPORT',
-                           'system', 'schema-migration',
-                           'Imported existing operation; prior transitions are unavailable.',
-                           updated_at
+                legacy_operations = connection.execute(
+                    """SELECT operations.operation_id, operations.status, operations.updated_at
                     FROM gateway_operations AS operations
                     WHERE NOT EXISTS (
                         SELECT 1 FROM gateway_operation_events AS events
                         WHERE events.operation_id = operations.operation_id
-                    )"""
-                )
+                    )
+                    ORDER BY operations.operation_id"""
+                ).fetchall()
+                for operation in legacy_operations:
+                    self._insert_gateway_event(
+                        connection, operation["operation_id"], None, operation["status"],
+                        "LEGACY_IMPORT", "system", "schema-migration",
+                        "Imported existing operation; prior transitions are unavailable.",
+                        operation["updated_at"],
+                    )
 
                 # Older releases persisted APPROVED operations before durable worker
                 # jobs existed. Capture only rows that this migration will enqueue so
@@ -305,17 +306,17 @@ class SQLitePolicyStore:
                            updated_at, updated_at
                     FROM _agentguard_backfilled_jobs"""
                 )
-                connection.execute(
-                    """INSERT INTO gateway_operation_events (
-                        operation_id, previous_status, new_status, event_type,
-                        actor_type, actor_id, reason, created_at
+                backfilled_jobs = connection.execute(
+                    """SELECT operation_id, updated_at
+                    FROM _agentguard_backfilled_jobs ORDER BY operation_id"""
+                ).fetchall()
+                for operation in backfilled_jobs:
+                    self._insert_gateway_event(
+                        connection, operation["operation_id"], "APPROVED", "APPROVED",
+                        "EXECUTION_JOB_BACKFILL", "system", "schema-migration",
+                        "Queued legacy approved operation during worker outbox migration.",
+                        operation["updated_at"],
                     )
-                    SELECT operation_id, 'APPROVED', 'APPROVED',
-                           'EXECUTION_JOB_BACKFILL', 'system', 'schema-migration',
-                           'Queued legacy approved operation during worker outbox migration.',
-                           updated_at
-                    FROM _agentguard_backfilled_jobs"""
-                )
                 connection.execute("DROP TABLE _agentguard_backfilled_jobs")
 
                 if audit_migration_required:
