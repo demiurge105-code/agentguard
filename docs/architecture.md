@@ -29,7 +29,7 @@ The canonical `examples/demo_agent.py` exercises the authenticated HTTP Gateway 
 8. Immediately before invoking the executor, the worker atomically verifies its worker ID, fencing token, and unexpired lease, then moves the job to `DISPATCH_STARTED` and the operation to `EXECUTING`. This is the no-replay boundary.
 9. The worker persists `SUCCEEDED`, `FAILED`, or `UNKNOWN` only if its fencing token is still current and the operation remains `EXECUTING`. Executor exceptions and arbitrary return data are not stored.
 
-Operation states remain `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. Job states are `QUEUED`, `LEASED`, `DISPATCH_STARTED`, `COMPLETED`, and `UNKNOWN`. A trusted executor may return a typed `ExecutionOutcome`; `FAILED` is accepted only when its contract confirms no side effect occurred.
+Operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, `UNKNOWN`, and `CANCELLED`. Job states are `QUEUED`, `LEASED`, `DISPATCH_STARTED`, `COMPLETED`, `UNKNOWN`, and `CANCELLED`. A trusted executor may return a typed `ExecutionOutcome`; `FAILED` is accepted only when its contract confirms no side effect occurred.
 
 An expired `LEASED` job can be reclaimed because the worker has not crossed the dispatch boundary; its fencing token increments, so the previous worker cannot start. Once `DISPATCH_STARTED` is durable, the job is never automatically re-leased. A crash between persisting this state and actually calling the executor can therefore produce zero execution attempts. A crash after an external side effect but before result persistence leaves an ambiguous operation; stale recovery moves it to `UNKNOWN`, retains the reservation, and fences late worker completion.
 
@@ -94,6 +94,7 @@ The worker uses the following job lifecycle:
 - `DISPATCH_STARTED`: the worker has crossed the no-automatic-replay boundary.
 - `COMPLETED`: a terminal `SUCCEEDED` or trusted `FAILED` result was persisted.
 - `UNKNOWN`: execution may have started, but its outcome cannot be safely established.
+- `CANCELLED`: an approved job was cancelled before `DISPATCH_STARTED`, for example during agent-token rotation. Its pre-dispatch lease is invalidated and its active reservation is released.
 
 Claiming a job runs under `BEGIN IMMEDIATE`. A lease is reclaimable only while the job is still `LEASED` and its expiry has passed. Each claim increments a monotonically increasing fencing token. Before calling the executor, the worker must atomically prove that its worker ID and fencing token still match and that its lease has not expired. That transition changes the operation from `APPROVED` to `EXECUTING` and the job to `DISPATCH_STARTED`.
 
@@ -117,6 +118,8 @@ The gateway is not a sandbox and does not protect against malicious same-process
 - A new policy creation response returns its raw agent token once.
 - The owner can rotate a token through `POST /policies/{policy_id}/rotate-agent-token`, authenticated by `AGENTGUARD_ADMIN_TOKEN`.
 - Rotation replaces the hash immediately. The previous token stops authenticating as soon as the update commits.
+- In the same `BEGIN IMMEDIATE` transaction, rotation cancels the policy's approved jobs in `QUEUED` or `LEASED`, marks their operations `CANCELLED`, increments the job fencing token, clears the worker lease, releases the active daily reservation, and records audit events.
+- Jobs at `DISPATCH_STARTED` or later are not cancelled automatically. Their external outcome may already be uncertain, so their reservation remains active; they require the existing inspection/reconciliation process rather than automatic replay or release.
 - The raw token is not returned by any read endpoint and must be saved by the caller when created or rotated.
 - Token hashes are compared with `hmac.compare_digest`.
 - Existing policies from databases created before this column was introduced receive a nullable `agent_token_hash` column through a schema migration. Those policies remain stored, but agent requests are denied until the owner rotates a token for them.

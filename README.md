@@ -307,7 +307,7 @@ POST /policies/<policy-id>/rotate-agent-token
 Authorization: Bearer <your-admin-token>
 ```
 
-The response contains the new `agent_token` once. Rotation replaces the stored hash immediately, so the previous token stops working. Save the new token securely.
+The response contains the new `agent_token` once. Rotation replaces the stored hash immediately, so the previous token stops working. In the same atomic database transaction, AgentGuard also cancels this policy's approved jobs that are still `QUEUED` or `LEASED`, marks their operations `CANCELLED`, invalidates any active worker lease, and releases the associated reserved daily budget. Jobs that have reached `DISPATCH_STARTED` or a later state are not cancelled automatically: an external effect may already have occurred, so their reservation remains active for reconciliation. Save the new token securely.
 
 ### Existing databases
 
