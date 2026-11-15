@@ -1000,15 +1000,19 @@ async def test_gateway_audit_endpoints_require_owner(app, admin_token):
         agent_headers = {"Authorization": f"Bearer {created['agent_token']}"}
         denied = await client.get(f"/gateway/operations/{operation_id}", headers=agent_headers)
         denied_events = await client.get(f"/gateway/operations/{operation_id}/events", headers=agent_headers)
+        denied_verify = await client.get(f"/gateway/operations/{operation_id}/events/verify", headers=agent_headers)
         denied_reconcile = await client.post(f"/gateway/operations/{operation_id}/reconcile", json={"reason": "checked"}, headers=agent_headers)
         owner_headers = {"Authorization": f"Bearer {admin_token}"}
         read = await client.get(f"/gateway/operations/{operation_id}", headers=owner_headers)
         events = await client.get(f"/gateway/operations/{operation_id}/events", headers=owner_headers)
-    assert [denied.status_code, denied_events.status_code, denied_reconcile.status_code] == [401, 401, 401]
-    assert read.status_code == events.status_code == 200
+        verified = await client.get(f"/gateway/operations/{operation_id}/events/verify", headers=owner_headers)
+    assert [denied.status_code, denied_events.status_code, denied_verify.status_code, denied_reconcile.status_code] == [401, 401, 401, 401]
+    assert read.status_code == events.status_code == verified.status_code == 200
     assert read.json()["reservation_status"] == "RESERVED"
     assert read.json()["execution_status"] == "QUEUED"
     assert events.json()["events"][0]["event_type"] == "OPERATION_CREATED"
+    assert verified.json()["valid"] is True
+    assert verified.json()["event_count"] == 1
     assert "agent_token" not in read.json()
 
 
@@ -1038,8 +1042,9 @@ async def test_gateway_audit_owner_endpoints_return_404_for_unknown_operation(ap
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         operation = await client.get("/gateway/operations/not-found", headers=headers)
         events = await client.get("/gateway/operations/not-found/events", headers=headers)
+        verified = await client.get("/gateway/operations/not-found/events/verify", headers=headers)
         reconcile = await client.post("/gateway/operations/not-found/reconcile", json={"reason": "Investigated."}, headers=headers)
-    assert [operation.status_code, events.status_code, reconcile.status_code] == [404, 404, 404]
+    assert [operation.status_code, events.status_code, verified.status_code, reconcile.status_code] == [404, 404, 404, 404]
 
 
 @pytest.mark.anyio

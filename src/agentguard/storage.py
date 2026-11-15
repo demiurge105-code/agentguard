@@ -21,6 +21,10 @@ from agentguard.policy import (
 )
 
 
+_GATEWAY_EVENT_GENESIS = "0000000000000000000000000000000000000000000000000000000000000000"
+_GATEWAY_EVENT_HASH_DOMAIN = b"agentguard.gateway-operation-event.v1:"
+
+
 class IdempotencyConflict(ValueError):
     """An idempotency key was reused for a different request."""
 
@@ -107,6 +111,8 @@ class SQLitePolicyStore:
                         result TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
+                        audit_event_count INTEGER NOT NULL DEFAULT 0 CHECK (audit_event_count >= 0),
+                        audit_head_hash TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000',
                         UNIQUE (idempotency_key),
                         FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
                     )"""
@@ -126,9 +132,45 @@ class SQLitePolicyStore:
                         actor_id TEXT NOT NULL,
                         reason TEXT NOT NULL,
                         created_at TEXT NOT NULL,
+                        previous_hash TEXT,
+                        event_hash TEXT,
                         FOREIGN KEY (operation_id) REFERENCES gateway_operations(operation_id)
                     )"""
                 )
+                # Upgrade existing databases once. Existing event rows are treated as
+                # the initial baseline; this does not prove their pre-migration history.
+                operation_columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(gateway_operations)").fetchall()
+                }
+                event_columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(gateway_operation_events)").fetchall()
+                }
+                audit_migration_required = (
+                    "audit_event_count" not in operation_columns
+                    or "audit_head_hash" not in operation_columns
+                    or "previous_hash" not in event_columns
+                    or "event_hash" not in event_columns
+                )
+                if "audit_event_count" not in operation_columns:
+                    connection.execute(
+                        "ALTER TABLE gateway_operations ADD COLUMN audit_event_count INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "audit_head_hash" not in operation_columns:
+                    connection.execute(
+                        "ALTER TABLE gateway_operations ADD COLUMN audit_head_hash TEXT NOT NULL "
+                        "DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'"
+                    )
+                if "previous_hash" not in event_columns:
+                    connection.execute(
+                        "ALTER TABLE gateway_operation_events ADD COLUMN previous_hash TEXT"
+                    )
+                if "event_hash" not in event_columns:
+                    connection.execute(
+                        "ALTER TABLE gateway_operation_events ADD COLUMN event_hash TEXT"
+                    )
+
                 connection.execute(
                     """CREATE INDEX IF NOT EXISTS idx_gateway_operation_events_operation
                     ON gateway_operation_events(operation_id, event_id)"""
@@ -225,21 +267,22 @@ class SQLitePolicyStore:
                         WHERE reservation.request_id LIKE 'gateway:%'"""
                     )
 
-                connection.execute(
-                    """INSERT INTO gateway_operation_events (
-                        operation_id, previous_status, new_status, event_type,
-                        actor_type, actor_id, reason, created_at
-                    )
-                    SELECT operation_id, NULL, status, 'LEGACY_IMPORT',
-                           'system', 'schema-migration',
-                           'Imported existing operation; prior transitions are unavailable.',
-                           updated_at
+                legacy_operations = connection.execute(
+                    """SELECT operations.operation_id, operations.status, operations.updated_at
                     FROM gateway_operations AS operations
                     WHERE NOT EXISTS (
                         SELECT 1 FROM gateway_operation_events AS events
                         WHERE events.operation_id = operations.operation_id
-                    )"""
-                )
+                    )
+                    ORDER BY operations.operation_id"""
+                ).fetchall()
+                for operation in legacy_operations:
+                    self._insert_gateway_event(
+                        connection, operation["operation_id"], None, operation["status"],
+                        "LEGACY_IMPORT", "system", "schema-migration",
+                        "Imported existing operation; prior transitions are unavailable.",
+                        operation["updated_at"],
+                    )
 
                 # Older releases persisted APPROVED operations before durable worker
                 # jobs existed. Capture only rows that this migration will enqueue so
@@ -263,18 +306,21 @@ class SQLitePolicyStore:
                            updated_at, updated_at
                     FROM _agentguard_backfilled_jobs"""
                 )
-                connection.execute(
-                    """INSERT INTO gateway_operation_events (
-                        operation_id, previous_status, new_status, event_type,
-                        actor_type, actor_id, reason, created_at
+                backfilled_jobs = connection.execute(
+                    """SELECT operation_id, updated_at
+                    FROM _agentguard_backfilled_jobs ORDER BY operation_id"""
+                ).fetchall()
+                for operation in backfilled_jobs:
+                    self._insert_gateway_event(
+                        connection, operation["operation_id"], "APPROVED", "APPROVED",
+                        "EXECUTION_JOB_BACKFILL", "system", "schema-migration",
+                        "Queued legacy approved operation during worker outbox migration.",
+                        operation["updated_at"],
                     )
-                    SELECT operation_id, 'APPROVED', 'APPROVED',
-                           'EXECUTION_JOB_BACKFILL', 'system', 'schema-migration',
-                           'Queued legacy approved operation during worker outbox migration.',
-                           updated_at
-                    FROM _agentguard_backfilled_jobs"""
-                )
                 connection.execute("DROP TABLE _agentguard_backfilled_jobs")
+
+                if audit_migration_required:
+                    self._backfill_gateway_event_hashes(connection)
         finally:
             connection.close()
 
@@ -528,6 +574,72 @@ class SQLitePolicyStore:
         }
 
     @staticmethod
+    def _gateway_event_hash(
+        event_id: int,
+        operation_id: str,
+        previous_status: str | None,
+        new_status: str,
+        event_type: str,
+        actor_type: str,
+        actor_id: str,
+        reason: str,
+        created_at: str,
+        previous_hash: str,
+    ) -> str:
+        canonical_event = json.dumps(
+            [
+                1,
+                event_id,
+                operation_id,
+                previous_status,
+                new_status,
+                event_type,
+                actor_type,
+                actor_id,
+                reason,
+                created_at,
+                previous_hash,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(_GATEWAY_EVENT_HASH_DOMAIN + canonical_event).hexdigest()
+
+    @classmethod
+    def _backfill_gateway_event_hashes(cls, connection: sqlite3.Connection) -> None:
+        operations = connection.execute(
+            "SELECT operation_id FROM gateway_operations ORDER BY operation_id"
+        ).fetchall()
+        for operation in operations:
+            operation_id = operation["operation_id"]
+            rows = connection.execute(
+                """SELECT event_id, operation_id, previous_status, new_status,
+                          event_type, actor_type, actor_id, reason, created_at
+                FROM gateway_operation_events
+                WHERE operation_id = ? ORDER BY event_id""",
+                (operation_id,),
+            ).fetchall()
+            previous_hash = _GATEWAY_EVENT_GENESIS
+            for row in rows:
+                event_hash = cls._gateway_event_hash(
+                    row["event_id"], row["operation_id"], row["previous_status"],
+                    row["new_status"], row["event_type"], row["actor_type"],
+                    row["actor_id"], row["reason"], row["created_at"], previous_hash,
+                )
+                connection.execute(
+                    """UPDATE gateway_operation_events
+                    SET previous_hash = ?, event_hash = ? WHERE event_id = ?""",
+                    (previous_hash, event_hash, row["event_id"]),
+                )
+                previous_hash = event_hash
+            connection.execute(
+                """UPDATE gateway_operations
+                SET audit_event_count = ?, audit_head_hash = ?
+                WHERE operation_id = ?""",
+                (len(rows), previous_hash, operation_id),
+            )
+
+    @staticmethod
     def _insert_gateway_event(
         connection: sqlite3.Connection,
         operation_id: str,
@@ -541,14 +653,40 @@ class SQLitePolicyStore:
     ) -> None:
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
             raise ValueError("Audit reason must contain 1-500 non-whitespace characters.")
-        connection.execute(
+        operation = connection.execute(
+            """SELECT audit_event_count, audit_head_hash
+            FROM gateway_operations WHERE operation_id = ?""",
+            (operation_id,),
+        ).fetchone()
+        if operation is None:
+            raise ValueError("Cannot append an audit event for an unknown operation.")
+
+        previous_hash = operation["audit_head_hash"]
+        cursor = connection.execute(
             """INSERT INTO gateway_operation_events (
                 operation_id, previous_status, new_status, event_type,
-                actor_type, actor_id, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                actor_type, actor_id, reason, created_at, previous_hash, event_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
             (operation_id, previous_status, new_status, event_type,
-             actor_type, actor_id, reason.strip(), created_at),
+             actor_type, actor_id, reason.strip(), created_at, previous_hash),
         )
+        event_id = cursor.lastrowid
+        event_hash = SQLitePolicyStore._gateway_event_hash(
+            event_id, operation_id, previous_status, new_status, event_type,
+            actor_type, actor_id, reason.strip(), created_at, previous_hash,
+        )
+        connection.execute(
+            "UPDATE gateway_operation_events SET event_hash = ? WHERE event_id = ?",
+            (event_hash, event_id),
+        )
+        updated = connection.execute(
+            """UPDATE gateway_operations
+            SET audit_event_count = audit_event_count + 1, audit_head_hash = ?
+            WHERE operation_id = ? AND audit_event_count = ? AND audit_head_hash = ?""",
+            (event_hash, operation_id, operation["audit_event_count"], previous_hash),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("Gateway audit head changed while appending an event.")
 
     def begin_gateway_operation(
         self,
@@ -1361,7 +1499,8 @@ class SQLitePolicyStore:
                 return None
             rows = connection.execute(
                 """SELECT event_id, operation_id, previous_status, new_status,
-                          event_type, actor_type, actor_id, reason, created_at
+                          event_type, actor_type, actor_id, reason, created_at,
+                          previous_hash, event_hash
                 FROM gateway_operation_events
                 WHERE operation_id = ? ORDER BY event_id""",
                 (operation_id,),
@@ -1369,6 +1508,88 @@ class SQLitePolicyStore:
         finally:
             connection.close()
         return [dict(row) for row in rows]
+
+    def verify_gateway_operation_events(self, operation_id: str) -> dict[str, object] | None:
+        """Verify an operation's event hash chain and its trusted in-database head."""
+        connection = self._connect()
+        try:
+            operation = connection.execute(
+                """SELECT audit_event_count, audit_head_hash
+                FROM gateway_operations WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                return None
+            rows = connection.execute(
+                """SELECT event_id, operation_id, previous_status, new_status,
+                          event_type, actor_type, actor_id, reason, created_at,
+                          previous_hash, event_hash
+                FROM gateway_operation_events
+                WHERE operation_id = ? ORDER BY event_id""",
+                (operation_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        previous_hash = _GATEWAY_EVENT_GENESIS
+        for row in rows:
+            if row["previous_hash"] != previous_hash:
+                return {
+                    "valid": False,
+                    "event_count": len(rows),
+                    "expected_event_count": operation["audit_event_count"],
+                    "first_invalid_event_id": row["event_id"],
+                    "reason_code": "PREVIOUS_HASH_MISMATCH",
+                    "head_hash": operation["audit_head_hash"],
+                }
+            try:
+                expected_hash = self._gateway_event_hash(
+                    row["event_id"], row["operation_id"], row["previous_status"],
+                    row["new_status"], row["event_type"], row["actor_type"],
+                    row["actor_id"], row["reason"], row["created_at"], previous_hash,
+                )
+            except (TypeError, ValueError, UnicodeError):
+                return {
+                    "valid": False,
+                    "event_count": len(rows),
+                    "expected_event_count": operation["audit_event_count"],
+                    "first_invalid_event_id": row["event_id"],
+                    "reason_code": "EVENT_DATA_INVALID",
+                    "head_hash": operation["audit_head_hash"],
+                }
+            if not isinstance(row["event_hash"], str) or row["event_hash"] != expected_hash:
+                return {
+                    "valid": False,
+                    "event_count": len(rows),
+                    "expected_event_count": operation["audit_event_count"],
+                    "first_invalid_event_id": row["event_id"],
+                    "reason_code": "EVENT_HASH_MISMATCH",
+                    "head_hash": operation["audit_head_hash"],
+                }
+            previous_hash = expected_hash
+
+        if len(rows) != operation["audit_event_count"]:
+            reason_code = "EVENT_COUNT_MISMATCH"
+        elif previous_hash != operation["audit_head_hash"]:
+            reason_code = "HEAD_HASH_MISMATCH"
+        else:
+            return {
+                "valid": True,
+                "event_count": len(rows),
+                "expected_event_count": operation["audit_event_count"],
+                "first_invalid_event_id": None,
+                "reason_code": None,
+                "head_hash": operation["audit_head_hash"],
+            }
+
+        return {
+            "valid": False,
+            "event_count": len(rows),
+            "expected_event_count": operation["audit_event_count"],
+            "first_invalid_event_id": None,
+            "reason_code": reason_code,
+            "head_hash": operation["audit_head_hash"],
+        }
 
     def reconcile_gateway_operation_unknown(
         self, operation_id: str, actor_id: str, reason: str

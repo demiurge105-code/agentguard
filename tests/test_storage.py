@@ -362,6 +362,10 @@ def test_gateway_audit_events_record_each_state_transition_atomically(tmp_path):
         (None, "APPROVED"), ("APPROVED", "EXECUTING"),
         ("EXECUTING", "SUCCEEDED"), ("SUCCEEDED", "SUCCEEDED"),
     ]
+    integrity = store.verify_gateway_operation_events(operation["operation_id"])
+    assert integrity is not None
+    assert integrity["valid"] is True
+    assert integrity["event_count"] == 4
 
 
 def test_gateway_audit_insert_failure_rolls_back_operation_and_reservation(tmp_path, monkeypatch):
@@ -542,6 +546,27 @@ def test_old_reservation_schema_migrates_conservatively(tmp_path):
         connection.execute("INSERT INTO daily_reservations VALUES ('policy', 'legacy-check', '2026-11-11', '5', 'alice', 1, 'allowed', 'ok')")
         connection.execute("CREATE TABLE gateway_operations (operation_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, canonical_intent TEXT NOT NULL, status TEXT NOT NULL, allowed INTEGER NOT NULL, reason_code TEXT NOT NULL, reason TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (idempotency_key))")
         connection.execute("INSERT INTO gateway_operations VALUES ('pending-op', 'policy', 'pending-key', '{}', 'EXECUTING', 1, 'allowed', 'ok', NULL, '2026-11-11T00:00:00+00:00', '2026-11-11T00:00:00+00:00')")
+        connection.execute(
+            """CREATE TABLE gateway_operation_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id TEXT NOT NULL,
+                previous_status TEXT,
+                new_status TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO gateway_operation_events (
+                operation_id, previous_status, new_status, event_type,
+                actor_type, actor_id, reason, created_at
+            ) VALUES ('pending-op', NULL, 'EXECUTING', 'LEGACY_EVENT',
+                      'system', 'old-version', 'Existing event before hash migration.',
+                      '2026-11-11T00:00:00+00:00')"""
+        )
         connection.commit()
     finally:
         connection.close()
@@ -552,6 +577,10 @@ def test_old_reservation_schema_migrates_conservatively(tmp_path):
     finally:
         connection.close()
     assert states == {"gateway:pending-op": "RESERVED", "legacy-check": "SETTLED"}
+    integrity = migrated.verify_gateway_operation_events("pending-op")
+    assert integrity is not None and integrity["valid"] is True
+    events = migrated.list_gateway_operation_events("pending-op")
+    assert events is not None and events[0]["event_hash"]
 
 
 def _create_executing_gateway_operation(store, token, key):
@@ -1004,3 +1033,130 @@ def test_existing_execution_job_table_migrates_to_support_cancelled(tmp_path):
         policy_id, hashlib.sha256(b"upgraded-token").hexdigest()
     ) is True
     assert upgraded.get_gateway_execution_status(operation["operation_id"]) == "CANCELLED"
+
+
+def test_gateway_event_hash_chain_verifies_and_detects_event_tampering(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-tamper.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-tamper"
+    )
+    operation_id = operation["operation_id"]
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is True
+    assert result["event_count"] == 1
+
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_operation_events SET reason = ? WHERE operation_id = ?",
+            ("tampered reason", operation_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "EVENT_HASH_MISMATCH"
+
+
+def test_gateway_event_hash_chain_detects_deleted_middle_event(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-middle.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-middle"
+    )
+    operation_id = operation["operation_id"]
+    assert store.claim_gateway_operation(operation_id, token) is True
+    assert store.complete_gateway_operation(
+        operation_id, "SUCCEEDED", "Execution completed."
+    ) is True
+    events = store.list_gateway_operation_events(operation_id)
+    assert events is not None and len(events) >= 3
+
+    connection = store._connect()
+    try:
+        connection.execute(
+            "DELETE FROM gateway_operation_events WHERE event_id = ?",
+            (events[1]["event_id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "PREVIOUS_HASH_MISMATCH"
+
+
+def test_gateway_event_hash_chain_detects_deleted_tail_event(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-tail.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-tail"
+    )
+    operation_id = operation["operation_id"]
+
+    connection = store._connect()
+    try:
+        event = connection.execute(
+            """SELECT event_id FROM gateway_operation_events
+            WHERE operation_id = ? ORDER BY event_id DESC LIMIT 1""",
+            (operation_id,),
+        ).fetchone()
+        connection.execute(
+            "DELETE FROM gateway_operation_events WHERE event_id = ?",
+            (event["event_id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation_id)
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "EVENT_COUNT_MISMATCH"
+
+
+def test_gateway_event_verification_rejects_malformed_hash_text(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-malformed.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-malformed"
+    )
+
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_operation_events SET event_hash = ? WHERE operation_id = ?",
+            ("not-a-valid-hash-🔒", operation["operation_id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation["operation_id"])
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "EVENT_HASH_MISMATCH"
