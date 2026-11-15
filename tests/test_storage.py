@@ -1133,3 +1133,30 @@ def test_gateway_event_hash_chain_detects_deleted_tail_event(tmp_path):
     assert result is not None
     assert result["valid"] is False
     assert result["reason_code"] == "EVENT_COUNT_MISMATCH"
+
+
+def test_gateway_event_verification_rejects_malformed_hash_text(tmp_path):
+    store = SQLitePolicyStore(tmp_path / "audit-hash-malformed.db")
+    token = "audit-agent-token"
+    policy_id = store.create_policy(
+        Policy("100", "200", ["Alice"]),
+        hashlib.sha256(token.encode()).hexdigest(),
+    )
+    operation = store.begin_gateway_operation(
+        ActionIntent(policy_id, "10", "Alice"), token, "audit-hash-malformed"
+    )
+
+    connection = store._connect()
+    try:
+        connection.execute(
+            "UPDATE gateway_operation_events SET event_hash = ? WHERE operation_id = ?",
+            ("not-a-valid-hash-🔒", operation["operation_id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = store.verify_gateway_operation_events(operation["operation_id"])
+    assert result is not None
+    assert result["valid"] is False
+    assert result["reason_code"] == "EVENT_HASH_MISMATCH"
