@@ -22,7 +22,7 @@ from agentguard.policy import (
 
 
 _GATEWAY_EVENT_GENESIS = "0000000000000000000000000000000000000000000000000000000000000000"
-_GATEWAY_EVENT_HASH_DOMAIN = b"agentguard.gateway-operation-event.v1\\0"
+_GATEWAY_EVENT_HASH_DOMAIN = b"agentguard.gateway-operation-event.v1:"
 
 
 class IdempotencyConflict(ValueError):
