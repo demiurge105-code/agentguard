@@ -1542,14 +1542,22 @@ class SQLitePolicyStore:
                     "reason_code": "PREVIOUS_HASH_MISMATCH",
                     "head_hash": operation["audit_head_hash"],
                 }
-            expected_hash = self._gateway_event_hash(
-                row["event_id"], row["operation_id"], row["previous_status"],
-                row["new_status"], row["event_type"], row["actor_type"],
-                row["actor_id"], row["reason"], row["created_at"], previous_hash,
-            )
-            if not isinstance(row["event_hash"], str) or not hmac.compare_digest(
-                row["event_hash"], expected_hash
-            ):
+            try:
+                expected_hash = self._gateway_event_hash(
+                    row["event_id"], row["operation_id"], row["previous_status"],
+                    row["new_status"], row["event_type"], row["actor_type"],
+                    row["actor_id"], row["reason"], row["created_at"], previous_hash,
+                )
+            except (TypeError, ValueError, UnicodeError):
+                return {
+                    "valid": False,
+                    "event_count": len(rows),
+                    "expected_event_count": operation["audit_event_count"],
+                    "first_invalid_event_id": row["event_id"],
+                    "reason_code": "EVENT_DATA_INVALID",
+                    "head_hash": operation["audit_head_hash"],
+                }
+            if not isinstance(row["event_hash"], str) or row["event_hash"] != expected_hash:
                 return {
                     "valid": False,
                     "event_count": len(rows),
@@ -1562,7 +1570,7 @@ class SQLitePolicyStore:
 
         if len(rows) != operation["audit_event_count"]:
             reason_code = "EVENT_COUNT_MISMATCH"
-        elif not hmac.compare_digest(previous_hash, operation["audit_head_hash"]):
+        elif previous_hash != operation["audit_head_hash"]:
             reason_code = "HEAD_HASH_MISMATCH"
         else:
             return {
