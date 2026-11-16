@@ -343,6 +343,26 @@ def verify_gateway_checkpoint(
                 return {"valid": False, "reason_code": "CHECKPOINT_MISMATCH"}
             by_ref[ref] = operation
 
+        document_by_ref = {
+            item["operation_ref"]: item for item in document["operations"]
+        }
+        predecessor_by_ref = (
+            {item["operation_ref"]: item for item in predecessor["operations"]}
+            if predecessor is not None else {}
+        )
+        for previous_ref, previous_item in predecessor_by_ref.items():
+            current_item = document_by_ref.get(previous_ref)
+            if current_item is None:
+                return {
+                    "valid": False, "reason_code": "CHECKPOINT_MISMATCH",
+                    "detail": "PREVIOUSLY_CHECKPOINTED_OPERATION_MISSING",
+                }
+            if current_item["event_count"] < previous_item["event_count"]:
+                return {
+                    "valid": False, "reason_code": "CHECKPOINT_MISMATCH",
+                    "detail": "PREVIOUSLY_CHECKPOINTED_EVENT_PREFIX_MISSING",
+                }
+
         for item in document["operations"]:
             operation = by_ref.get(item["operation_ref"])
             if operation is None:
@@ -371,6 +391,19 @@ def verify_gateway_checkpoint(
                     "valid": False, "reason_code": "CHECKPOINT_MISMATCH",
                     "detail": "CHECKPOINTED_EVENT_PREFIX_MISMATCH",
                 }
+
+            previous_item = predecessor_by_ref.get(item["operation_ref"])
+            if previous_item is not None:
+                previous_count = previous_item["event_count"]
+                previous_prefix_hash = (
+                    GENESIS_HASH if previous_count == 0
+                    else events[previous_count - 1]["event_hash"]
+                )
+                if previous_prefix_hash != previous_item["head_hash"]:
+                    return {
+                        "valid": False, "reason_code": "CHECKPOINT_MISMATCH",
+                        "detail": "PREVIOUSLY_CHECKPOINTED_EVENT_PREFIX_MISMATCH",
+                    }
 
         return {
             "valid": True,
