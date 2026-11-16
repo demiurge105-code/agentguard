@@ -11,9 +11,15 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentguard.chains import normalize_chain_id, normalize_recipient
+from agentguard.checkpoints import (
+    CheckpointError,
+    create_gateway_checkpoint,
+    verify_gateway_checkpoint,
+)
 from agentguard.gateway import GatewayAuthenticationError, PrintOnlyExecutor, TrustedExecutionGateway
 from agentguard.intent import ActionIntent
 from agentguard.policy import Policy
@@ -133,6 +139,19 @@ class GatewayReconciliationInput(BaseModel):
         if not isinstance(value, str) or not value.strip():
             raise ValueError("Reconciliation reason must not be empty or whitespace.")
         return value.strip()
+
+
+class GatewayCheckpointExportInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    previous_checkpoint_json: str | None = Field(default=None, max_length=10_000_000)
+
+
+class GatewayCheckpointVerifyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_json: str = Field(min_length=1, max_length=10_000_000)
+    previous_checkpoint_json: str | None = Field(default=None, max_length=10_000_000)
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -445,6 +464,40 @@ def create_app(
             "reconciled": True,
             "note": "UNKNOWN does not authorize another execution attempt.",
         }
+
+
+    @application.post("/gateway/checkpoints/export")
+    def export_gateway_checkpoint(
+        data: GatewayCheckpointExportInput,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> Response:
+        require_admin(credentials)
+        try:
+            checkpoint_json = create_gateway_checkpoint(
+                get_store(), data.previous_checkpoint_json
+            )
+        except CheckpointError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except sqlite3.Error as error:
+            raise HTTPException(
+                status_code=503, detail="Gateway storage is temporarily unavailable."
+            ) from error
+        return Response(content=checkpoint_json, media_type="application/json")
+
+    @application.post("/gateway/checkpoints/verify")
+    def verify_gateway_checkpoint_api(
+        data: GatewayCheckpointVerifyInput,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> dict[str, object]:
+        require_admin(credentials)
+        try:
+            return verify_gateway_checkpoint(
+                get_store(), data.checkpoint_json, data.previous_checkpoint_json
+            )
+        except sqlite3.Error as error:
+            raise HTTPException(
+                status_code=503, detail="Gateway storage is temporarily unavailable."
+            ) from error
 
     return application
 
