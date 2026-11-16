@@ -199,6 +199,13 @@ AgentGuard is not a wallet security system. It does not hold keys, sign transact
 - Token, DAO, or own blockchain
 
 
-## External Gateway checkpoints (specified, not yet implemented)
+## External Gateway checkpoints
 
-The v1 checkpoint format and its integrity, snapshot, and verification rules are specified in [docs/external-checkpoints.md](external-checkpoints.md). This is a design contract only: checkpoint export, import, local verification, and external publication are not implemented yet.
+The v1 checkpoint format and its integrity, snapshot, and verification rules are specified in [docs/external-checkpoints.md](external-checkpoints.md). Owner-authenticated API endpoints now export a canonical checkpoint JSON document and verify a supplied document against the local database. Export and verification use one SQLite read transaction so installation identity, operation rows, event counts, and event hashes come from a consistent snapshot.
+
+- `POST /gateway/checkpoints/export` returns the checkpoint as an `application/json` document. The optional `previous_checkpoint_json` body field links a new checkpoint to the immediately preceding document; omit it only for the genesis checkpoint.
+- `POST /gateway/checkpoints/verify` accepts `checkpoint_json` and, for sequence numbers greater than one, `previous_checkpoint_json`. Checkpoint JSON is passed as a string so duplicate object keys can be rejected during parsing.
+
+Checkpoint verification validates the document schema and hash, installation identity, predecessor link, every checkpointed operation's complete current local event chain, and the event hash at the checkpointed prefix position. Later appended events and newly created operations are allowed. Missing checkpointed operations or changed checkpointed prefixes fail with `CHECKPOINT_MISMATCH`.
+
+The endpoints require the owner/admin bearer token. No checkpoint is published or stored externally by AgentGuard, and no GitHub credentials are held. The owner must retain the returned JSON independently. A checkpoint hash is not a signature or proof of publisher identity; anyone able to rewrite the database and every external copy can still replace the history.
