@@ -145,3 +145,5 @@ The initial implementation exposes two owner-authenticated API endpoints:
 The document is returned directly as `application/json`; save that exact response outside the AgentGuard database. Passing imported documents as strings allows the parser to reject duplicate JSON object keys before normal object decoding can discard them. When verifying a later checkpoint, verification also requires every operation and event prefix recorded by its immediate predecessor to remain present and unchanged.
 
 The API does not store GitHub credentials or publish checkpoints automatically. Publication to an independently controlled repository or storage account is a separate integration step and must be explicit.
+
+Retain every checkpoint in sequence to preserve the verifiable history.
