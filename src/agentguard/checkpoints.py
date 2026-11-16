@@ -29,6 +29,10 @@ class CheckpointError(ValueError):
     """A checkpoint document is invalid or cannot be linked to its predecessor."""
 
 
+class CheckpointIntegrityError(CheckpointError):
+    """The local event history is inconsistent and cannot be checkpointed."""
+
+
 def _reject_constant(value: str) -> None:
     raise CheckpointError(f"Non-standard JSON constant is not allowed: {value}.")
 
@@ -268,7 +272,12 @@ def create_gateway_checkpoint(
         ).fetchall()
         entries = []
         for operation in operation_rows:
-            events, head_hash = _read_and_verify_operation(store, connection, operation)
+            try:
+                events, head_hash = _read_and_verify_operation(store, connection, operation)
+            except CheckpointError as error:
+                raise CheckpointIntegrityError(
+                    "Local Gateway event history is inconsistent; refusing to export."
+                ) from error
             entries.append({
                 "operation_ref": _operation_ref(operation["operation_id"]),
                 "event_count": len(events),
