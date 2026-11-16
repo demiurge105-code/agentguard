@@ -198,9 +198,12 @@ def _check_chain_link(
 
 
 def _read_installation_id(connection: sqlite3.Connection) -> str:
-    row = connection.execute(
-        "SELECT value FROM agentguard_metadata WHERE key = 'installation_id'"
-    ).fetchone()
+    try:
+        row = connection.execute(
+            "SELECT value FROM agentguard_metadata WHERE key = 'installation_id'"
+        ).fetchone()
+    except sqlite3.Error as error:
+        raise RuntimeError("INSTALLATION_ID_MISSING") from error
     if row is None:
         raise RuntimeError("INSTALLATION_ID_MISSING")
     try:
