@@ -1160,3 +1160,35 @@ async def test_gateway_checkpoint_verify_rejects_invalid_json_document(app, admi
         )
     assert response.status_code == 200
     assert response.json() == {"valid": False, "reason_code": "CHECKPOINT_INVALID"}
+
+
+
+@pytest.mark.anyio
+async def test_gateway_checkpoint_export_fails_closed_on_local_audit_corruption(
+    app, admin_token
+):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        submitted = await submit_gateway(
+            client, created["policy_id"], "checkpoint-corrupt-api", created["agent_token"]
+        )
+        operation_id = submitted.json()["operation_id"]
+
+        connection = app.state.store._connect()
+        try:
+            connection.execute(
+                "UPDATE gateway_operation_events SET reason = 'tampered' WHERE operation_id = ?",
+                (operation_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        response = await client.post(
+            "/gateway/checkpoints/export",
+            json={},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    assert response.status_code == 503
+    assert "refusing to export" in response.json()["detail"]
