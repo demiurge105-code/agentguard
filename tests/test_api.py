@@ -1083,3 +1083,79 @@ async def test_stale_recovery_api_rejects_invalid_age_and_empty_reason(app, admi
         empty_reason = await client.post("/gateway/operations/recover-stale", json={"stale_after_seconds": 300, "reason": "  "}, headers=headers)
     assert short_age.status_code == 422
     assert empty_reason.status_code == 422
+
+
+
+@pytest.mark.anyio
+async def test_gateway_checkpoint_endpoints_are_owner_only_and_support_chained_export(
+    app, admin_token
+):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = (await create_policy(client, admin_token)).json()
+        submitted = await submit_gateway(
+            client, created["policy_id"], "checkpoint-api", created["agent_token"]
+        )
+        assert submitted.status_code == 200
+
+        agent_headers = {"Authorization": f"Bearer {created['agent_token']}"}
+        owner_headers = {"Authorization": f"Bearer {admin_token}"}
+        denied_export = await client.post(
+            "/gateway/checkpoints/export", json={}, headers=agent_headers
+        )
+        denied_verify = await client.post(
+            "/gateway/checkpoints/verify",
+            json={"checkpoint_json": "{}"},
+            headers=agent_headers,
+        )
+        first = await client.post(
+            "/gateway/checkpoints/export", json={}, headers=owner_headers
+        )
+        assert first.status_code == 200
+        assert first.headers["content-type"].startswith("application/json")
+
+        verified_first = await client.post(
+            "/gateway/checkpoints/verify",
+            json={"checkpoint_json": first.text},
+            headers=owner_headers,
+        )
+        second = await client.post(
+            "/gateway/checkpoints/export",
+            json={"previous_checkpoint_json": first.text},
+            headers=owner_headers,
+        )
+        verified_second = await client.post(
+            "/gateway/checkpoints/verify",
+            json={
+                "checkpoint_json": second.text,
+                "previous_checkpoint_json": first.text,
+            },
+            headers=owner_headers,
+        )
+        missing_predecessor = await client.post(
+            "/gateway/checkpoints/verify",
+            json={"checkpoint_json": second.text},
+            headers=owner_headers,
+        )
+
+    assert denied_export.status_code == denied_verify.status_code == 401
+    assert verified_first.status_code == 200
+    assert verified_first.json()["valid"] is True
+    assert second.status_code == 200
+    assert json.loads(second.text)["sequence"] == 2
+    assert verified_second.json()["valid"] is True
+    assert missing_predecessor.json() == {
+        "valid": False, "reason_code": "CHECKPOINT_INVALID"
+    }
+
+
+@pytest.mark.anyio
+async def test_gateway_checkpoint_verify_rejects_invalid_json_document(app, admin_token):
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/gateway/checkpoints/verify",
+            json={"checkpoint_json": '{"format_version":1,"format_version":1}'},
+            headers=headers,
+        )
+    assert response.status_code == 200
+    assert response.json() == {"valid": False, "reason_code": "CHECKPOINT_INVALID"}
