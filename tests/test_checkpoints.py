@@ -183,3 +183,34 @@ def test_empty_database_can_be_checkpointed(tmp_path):
     assert checkpoint["operation_count"] == 0
     assert checkpoint["operations"] == []
     assert verify_gateway_checkpoint(store, checkpoint_json)["valid"] is True
+
+
+def test_next_checkpoint_cannot_drop_previously_checkpointed_operation(tmp_path):
+    store, policy_id, token = make_store(tmp_path / "checkpoint-drop-between.db")
+    operation_id = create_operation(
+        store, policy_id, token, "checkpoint-drop-between"
+    )
+    first_json = create_gateway_checkpoint(store)
+
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            "DELETE FROM gateway_operation_events WHERE operation_id = ?",
+            (operation_id,),
+        )
+        connection.execute(
+            "DELETE FROM gateway_operations WHERE operation_id = ?",
+            (operation_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    second_json = create_gateway_checkpoint(store, first_json)
+    result = verify_gateway_checkpoint(store, second_json, first_json)
+
+    assert result["valid"] is False
+    assert result["reason_code"] == "CHECKPOINT_MISMATCH"
+    assert result["detail"] == "PREVIOUSLY_CHECKPOINTED_OPERATION_MISSING"
+
