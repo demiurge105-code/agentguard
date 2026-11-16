@@ -197,3 +197,8 @@ AgentGuard is not a wallet security system. It does not hold keys, sign transact
 - User accounts, OAuth, JWT, or a full permissions system
 - Rate limiting and public production deployment hardening
 - Token, DAO, or own blockchain
+
+
+## External Gateway checkpoints (specified, not yet implemented)
+
+The v1 checkpoint format and its integrity, snapshot, and verification rules are specified in [docs/external-checkpoints.md](external-checkpoints.md). This is a design contract only: checkpoint export, import, local verification, and external publication are not implemented yet.
