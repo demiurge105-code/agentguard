@@ -478,9 +478,9 @@ def create_app(
             )
         except CheckpointError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        except sqlite3.Error as error:
+        except (sqlite3.Error, RuntimeError) as error:
             raise HTTPException(
-                status_code=503, detail="Gateway storage is temporarily unavailable."
+                status_code=503, detail="Gateway checkpoint storage is unavailable or inconsistent."
             ) from error
         return Response(content=checkpoint_json, media_type="application/json")
 
