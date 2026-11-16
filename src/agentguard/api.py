@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from agentguard.chains import normalize_chain_id, normalize_recipient
 from agentguard.checkpoints import (
     CheckpointError,
+    CheckpointIntegrityError,
     create_gateway_checkpoint,
     verify_gateway_checkpoint,
 )
@@ -476,6 +477,8 @@ def create_app(
             checkpoint_json = create_gateway_checkpoint(
                 get_store(), data.previous_checkpoint_json
             )
+        except CheckpointIntegrityError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except CheckpointError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except (sqlite3.Error, RuntimeError) as error:
