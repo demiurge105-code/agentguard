@@ -23,6 +23,7 @@ from agentguard.policy import (
 
 _GATEWAY_EVENT_GENESIS = "0000000000000000000000000000000000000000000000000000000000000000"
 _GATEWAY_EVENT_HASH_DOMAIN = b"agentguard.gateway-operation-event.v1:"
+_INSTALLATION_APPLICATION_ID = 0x41475541  # "AGUA"
 
 
 class IdempotencyConflict(ValueError):
@@ -48,9 +49,69 @@ class SQLitePolicyStore:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    def _ensure_installation_identity(self, connection: sqlite3.Connection) -> None:
+        """Create the persistent installation identity once, or fail closed."""
+        application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+        metadata_table = connection.execute(
+            """SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'agentguard_metadata'"""
+        ).fetchone()
+
+        if application_id == _INSTALLATION_APPLICATION_ID:
+            if metadata_table is None:
+                raise RuntimeError(
+                    "Installation metadata table is missing; refusing to create a new installation identity."
+                )
+            row = connection.execute(
+                "SELECT value FROM agentguard_metadata WHERE key = 'installation_id'"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Installation ID is missing; refusing to generate a replacement identity."
+                )
+            try:
+                installation_id = str(uuid.UUID(row["value"]))
+            except (ValueError, TypeError, AttributeError) as error:
+                raise RuntimeError("Installation ID is invalid.") from error
+            if installation_id != row["value"]:
+                raise RuntimeError("Installation ID is invalid.")
+            return
+
+        if application_id != 0:
+            raise RuntimeError(
+                "Database application_id is already assigned to another application."
+            )
+        if metadata_table is not None:
+            raise RuntimeError(
+                "Installation metadata exists without its database marker; refusing to rotate identity."
+            )
+
+        installation_id = str(uuid.uuid4())
+        connection.execute(
+            """CREATE TABLE agentguard_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO agentguard_metadata (key, value) VALUES ('installation_id', ?)",
+            (installation_id,),
+        )
+        connection.execute(f"PRAGMA application_id = {_INSTALLATION_APPLICATION_ID}")
+
     def _initialise(self) -> None:
         connection = self._connect()
         try:
+            # Serialize identity bootstrap so concurrent store initializations
+            # cannot create different installation IDs.
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_installation_identity(connection)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
             with connection:
                 connection.execute(
                     """CREATE TABLE IF NOT EXISTS policies (
@@ -323,6 +384,26 @@ class SQLitePolicyStore:
                     self._backfill_gateway_event_hashes(connection)
         finally:
             connection.close()
+
+    def get_installation_id(self) -> str:
+        """Return the stable UUID identifying this database installation."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT value FROM agentguard_metadata WHERE key = 'installation_id'"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if row is None:
+            raise RuntimeError("Installation ID is missing.")
+        try:
+            installation_id = str(uuid.UUID(row["value"]))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise RuntimeError("Installation ID is invalid.") from error
+        if installation_id != row["value"]:
+            raise RuntimeError("Installation ID is invalid.")
+        return installation_id
 
     def create_policy(self, policy: Policy, agent_token_hash: str | None = None) -> str:
         """Persist a policy and optional SHA-256 agent-token hash."""
