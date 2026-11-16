@@ -97,12 +97,15 @@ def _parse_document(raw: str) -> dict[str, Any]:
         )
     except CheckpointError:
         raise
-    except (json.JSONDecodeError, UnicodeError, TypeError) as error:
+    except (json.JSONDecodeError, UnicodeError, TypeError, RecursionError) as error:
         raise CheckpointError("Checkpoint is not valid JSON.") from error
     if not isinstance(value, dict):
         raise CheckpointError("Checkpoint root must be a JSON object.")
-    _reject_floats(value)
-    _validate_document(value)
+    try:
+        _reject_floats(value)
+        _validate_document(value)
+    except RecursionError as error:
+        raise CheckpointError("Checkpoint nesting is too deep.") from error
     return value
 
 
@@ -153,8 +156,10 @@ def _validate_document(document: dict[str, Any]) -> None:
         if previous_ref is not None and operation_ref <= previous_ref:
             raise CheckpointError("Operations must be uniquely sorted by operation_ref.")
         previous_ref = operation_ref
-        _require_int(operation["event_count"], "event_count", 0)
-        _require_hash(operation["head_hash"], "head_hash")
+        event_count = _require_int(operation["event_count"], "event_count", 0)
+        head_hash = _require_hash(operation["head_hash"], "head_hash")
+        if event_count == 0 and head_hash != GENESIS_HASH:
+            raise CheckpointError("An empty event chain must use the genesis hash.")
 
     _require_hash(document["previous_checkpoint_hash"], "previous_checkpoint_hash")
     supplied_hash = _require_hash(document["checkpoint_hash"], "checkpoint_hash")
