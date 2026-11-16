@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 import sqlite3
+import uuid
 import hashlib
 from threading import Event
 import pytest
@@ -1160,3 +1161,73 @@ def test_gateway_event_verification_rejects_malformed_hash_text(tmp_path):
     assert result is not None
     assert result["valid"] is False
     assert result["reason_code"] == "EVENT_HASH_MISMATCH"
+
+
+def test_installation_id_is_created_once_and_persists_after_reopening(tmp_path):
+    path = tmp_path / "installation-id.db"
+
+    first_store = SQLitePolicyStore(path)
+    first_id = first_store.get_installation_id()
+
+    assert str(uuid.UUID(first_id)) == first_id
+    assert SQLitePolicyStore(path).get_installation_id() == first_id
+
+
+def test_existing_database_migration_creates_installation_id(tmp_path):
+    path = tmp_path / "legacy-installation.db"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """CREATE TABLE policies (
+                policy_id TEXT PRIMARY KEY,
+                max_transaction TEXT NOT NULL,
+                daily_limit TEXT NOT NULL,
+                allowed_recipients TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO policies VALUES (?, ?, ?, ?, ?)",
+            ("legacy-policy", "100", "200", '["alice"]', "2026-11-01T00:00:00+00:00"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SQLitePolicyStore(path)
+
+    assert str(uuid.UUID(migrated.get_installation_id())) == migrated.get_installation_id()
+    assert migrated.get_policy("legacy-policy") is not None
+
+
+def test_missing_installation_id_fails_closed(tmp_path):
+    path = tmp_path / "missing-installation-id.db"
+    SQLitePolicyStore(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "DELETE FROM agentguard_metadata WHERE key = 'installation_id'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="Installation ID is missing"):
+        SQLitePolicyStore(path)
+
+
+def test_missing_installation_metadata_table_fails_closed(tmp_path):
+    path = tmp_path / "missing-installation-table.db"
+    SQLitePolicyStore(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE agentguard_metadata")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="metadata table is missing"):
+        SQLitePolicyStore(path)
+
