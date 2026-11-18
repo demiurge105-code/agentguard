@@ -8,6 +8,8 @@ A checkpoint is not a signature, proof of authorship, or immutable storage. SHA-
 
 The checkpoint contains no transaction payloads, recipient addresses, amounts, policy contents, or event reasons.
 
+For step-by-step export, independent retention, and verification instructions, see the [External Gateway Checkpoints Operator Runbook](external-checkpoints-runbook.md).
+
 ## Canonical encoding and hashes
 
 All hashes use SHA-256 and lowercase hexadecimal output.
@@ -124,6 +126,8 @@ When a predecessor is supplied, require:
 - the predecessor's own checkpoint hash to be valid.
 
 Without a predecessor, only the genesis checkpoint (sequence 1 and all-zero previous hash) can be accepted as a chain root. A later checkpoint must not be treated as a verified root merely because its own hash is valid.
+
+To establish the full retained sequence, verify each checkpoint in order starting with genesis and supply the immediately preceding document on each verification. The endpoint accepts one predecessor at a time; it does not recursively retrieve older checkpoint files.
 
 ## Failure codes
 
