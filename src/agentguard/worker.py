@@ -139,9 +139,9 @@ class ExecutionWorker:
                     OperationStatus.UNKNOWN: "Execution outcome is uncertain.",
                 }[terminal_status]
             elif execution_result is None:
-                terminal_status = OperationStatus.SUCCEEDED
+                terminal_status = OperationStatus.UNKNOWN
                 no_side_effect_confirmed = False
-                stored_result = "Execution completed."
+                stored_result = "Executor returned no explicit outcome; outcome may be unknown."
             else:
                 terminal_status = OperationStatus.UNKNOWN
                 no_side_effect_confirmed = False
