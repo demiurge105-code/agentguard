@@ -56,7 +56,7 @@ def test_exact_retry_returns_stored_result_without_second_execution(tmp_path):
     store, policy_id, token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     intent = make_intent(policy_id)
 
@@ -403,7 +403,7 @@ def test_typed_verified_failure_releases_daily_budget(tmp_path):
     failed = gateway.submit(make_intent(policy_id, "10"), token, "verified-failure")
     assert failed.status is OperationStatus.FAILED
     assert store.get_gateway_operation_by_id(failed.operation_id)["reservation_status"] == "RELEASED"
-    successful = TrustedExecutionGateway(store, lambda intent, operation_id: None).submit(make_intent(policy_id, "15"), token, "after-verified-failure")
+    successful = TrustedExecutionGateway(store, lambda intent, operation_id: ExecutionOutcome(OperationStatus.SUCCEEDED)).submit(make_intent(policy_id, "15"), token, "after-verified-failure")
     assert successful.status is OperationStatus.SUCCEEDED
 
 
