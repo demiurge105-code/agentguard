@@ -27,7 +27,10 @@ def test_worker_executes_queued_job_and_settles_reservation(tmp_path):
     calls = []
     worker = ExecutionWorker(
         store,
-        lambda action, operation_id: calls.append((action, operation_id)) or ExecutionOutcome(OperationStatus.SUCCEEDED),
+        lambda action, operation_id: (
+            calls.append((action, operation_id))
+            or ExecutionOutcome(OperationStatus.SUCCEEDED)
+        ),
         "worker-a",
     )
 
@@ -215,7 +218,10 @@ def test_worker_result_persistence_failure_requires_unknown_recovery(tmp_path, m
     calls = []
     worker = ExecutionWorker(
         store,
-        lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED),
+        lambda intent, operation_id: (
+            calls.append(operation_id)
+            or ExecutionOutcome(OperationStatus.SUCCEEDED)
+        ),
         "worker-a",
     )
     original_complete = store.complete_execution_job
@@ -260,7 +266,6 @@ def test_worker_typed_verified_failure_releases_reservation(tmp_path):
     final = store.get_gateway_operation_by_id(operation["operation_id"])
     assert final["status"] == "FAILED"
     assert final["reservation_status"] == "RELEASED"
-
 
 
 def test_worker_none_executor_outcome_becomes_unknown_and_is_not_retried(tmp_path):
