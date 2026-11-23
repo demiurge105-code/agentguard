@@ -52,7 +52,7 @@ The current flow is:
 3. An allowed operation is persisted as `APPROVED`. A denied operation is persisted as `DENIED` and never reaches the executor.
 4. The gateway revalidates the current agent token and atomically changes `APPROVED` to `EXECUTING`. Only the caller that wins this compare-and-set transition may invoke the gateway-owned executor. A token revoked before this claim cannot execute; revocation after the claim does not cancel an already-started operation.
 5. The executor receives the same immutable `ActionIntent` and stable operation ID. The gateway does not rebuild amount or recipient fields from a separate payload.
-6. The outcome is persisted as `SUCCEEDED`. If the executor raises or returns unsupported data, the operation becomes `UNKNOWN`. Arbitrary executor output and exception messages are not persisted; only a fixed status message is stored.
+6. The executor must return an explicit `ExecutionOutcome`. Only `ExecutionOutcome(SUCCEEDED)` is persisted as `SUCCEEDED`; `FAILED` requires `no_side_effect_confirmed=True`. An exception, `None`, unsupported return value, or explicit `UNKNOWN` is persisted as `UNKNOWN`. Ambiguous outcomes retain their budget reservation and are never automatically re-executed on retry. Arbitrary executor output and exception messages are not persisted; only a fixed status message is stored.
 
 The persisted operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. The current gateway uses `UNKNOWN` for ambiguous executor outcomes. `FAILED` is reserved for a future executor contract that can prove a failure had no side effect.
 
