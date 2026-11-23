@@ -642,6 +642,7 @@ async def test_gateway_endpoint_queues_allowed_action_without_inline_execution(a
 
 @pytest.mark.anyio
 async def test_api_enqueue_then_separate_worker_completes_operation(app, admin_token):
+    from agentguard.gateway import ExecutionOutcome, OperationStatus
     from agentguard.worker import ExecutionWorker
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -655,7 +656,7 @@ async def test_api_enqueue_then_separate_worker_completes_operation(app, admin_t
 
         worker = ExecutionWorker(
             app.state.store,
-            lambda intent, operation_id: None,
+            lambda intent, operation_id: ExecutionOutcome(OperationStatus.SUCCEEDED),
             "integration-worker",
         )
         assert worker.run_once() == operation_id
