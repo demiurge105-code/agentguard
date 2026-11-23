@@ -271,6 +271,31 @@ def test_executor_exception_becomes_unknown_and_is_not_retried(tmp_path):
     assert first.result == "Executor raised an exception; outcome may be unknown."
 
 
+
+def test_none_executor_outcome_becomes_unknown_and_is_not_retried(tmp_path):
+    store, policy_id, token = make_store(tmp_path, daily_limit="20")
+    calls = []
+
+    def executor(intent, operation_id):
+        calls.append(operation_id)
+        return None
+
+    gateway = TrustedExecutionGateway(store, executor)
+    intent = make_intent(policy_id, amount="10")
+
+    first = gateway.submit(intent, token, "implicit-none")
+    retry = gateway.submit(intent, token, "implicit-none")
+
+    assert first.status is OperationStatus.UNKNOWN
+    assert retry == first
+    assert first.result == "Executor returned no explicit outcome; outcome may be unknown."
+    assert store.get_gateway_operation_by_id(first.operation_id)["reservation_status"] == "RESERVED"
+    assert len(calls) == 1
+
+    denied = gateway.submit(make_intent(policy_id, amount="11"), token, "after-unknown")
+    assert denied.status is OperationStatus.DENIED
+    assert len(calls) == 1
+
 def test_unsupported_executor_output_is_not_persisted(tmp_path):
     store, policy_id, token = make_store(tmp_path)
     gateway = TrustedExecutionGateway(
