@@ -42,6 +42,43 @@ def test_checkpoint_export_and_verification_uses_opaque_refs(tmp_path):
     assert verify_gateway_checkpoint(store, checkpoint_json)["valid"] is True
 
 
+def test_checkpoint_rejects_omitted_operation_even_when_hash_is_recomputed(tmp_path):
+    store, policy_id, token = make_store(tmp_path / "checkpoint-omission.db")
+    create_operation(store, policy_id, token, "checkpoint-omission-a")
+    create_operation(store, policy_id, token, "checkpoint-omission-b")
+    checkpoint = json.loads(create_gateway_checkpoint(store))
+
+    checkpoint["operations"].pop()
+    checkpoint["operation_count"] = len(checkpoint["operations"])
+    payload = {key: value for key, value in checkpoint.items() if key != "checkpoint_hash"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    checkpoint["checkpoint_hash"] = hashlib.sha256(
+        b"agentguard.gateway-checkpoint.v2:" + canonical
+    ).hexdigest()
+
+    result = verify_gateway_checkpoint(store, json.dumps(checkpoint))
+    assert result["valid"] is False
+    assert result["reason_code"] == "CHECKPOINT_MISMATCH"
+    assert result["detail"] == "CHECKPOINT_OPERATION_SET_MISMATCH"
+
+
+def test_v1_checkpoint_remains_verifiable_but_completeness_is_unverified(tmp_path):
+    store, policy_id, token = make_store(tmp_path / "checkpoint-v1-compat.db")
+    create_operation(store, policy_id, token, "checkpoint-v1-compat")
+    checkpoint = json.loads(create_gateway_checkpoint(store))
+    checkpoint["format_version"] = 1
+    checkpoint.pop("snapshot_event_id")
+    payload = {key: value for key, value in checkpoint.items() if key != "checkpoint_hash"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    checkpoint["checkpoint_hash"] = hashlib.sha256(
+        b"agentguard.gateway-checkpoint.v1:" + canonical
+    ).hexdigest()
+
+    result = verify_gateway_checkpoint(store, json.dumps(checkpoint))
+    assert result["valid"] is True
+    assert result["completeness_verified"] is False
+
+
 def test_checkpoint_allows_appended_events_and_new_operations(tmp_path):
     store, policy_id, token = make_store(tmp_path / "checkpoint-append.db")
     operation_id = create_operation(store, policy_id, token, "checkpoint-append")
