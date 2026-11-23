@@ -54,7 +54,7 @@ The current flow is:
 5. The executor receives the same immutable `ActionIntent` and stable operation ID. The gateway does not rebuild amount or recipient fields from a separate payload.
 6. The executor must return an explicit `ExecutionOutcome`. Only `ExecutionOutcome(SUCCEEDED)` is persisted as `SUCCEEDED`; `FAILED` requires `no_side_effect_confirmed=True`. An exception, `None`, unsupported return value, or explicit `UNKNOWN` is persisted as `UNKNOWN`. Ambiguous outcomes retain their budget reservation and are never automatically re-executed on retry. Arbitrary executor output and exception messages are not persisted; only a fixed status message is stored.
 
-The persisted operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. The current gateway uses `UNKNOWN` for ambiguous executor outcomes. `FAILED` is reserved for a future executor contract that can prove a failure had no side effect.
+The persisted operation states are `APPROVED`, `DENIED`, `EXECUTING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`. The current gateway uses `UNKNOWN` for ambiguous executor outcomes. `FAILED` is accepted only when the executor explicitly reports failure and confirms that no side effect occurred.
 
 Idempotency keys are globally unique within the SQLite database and are bound to the policy ID and exact canonical intent. Reusing a key with a different policy or intent returns an idempotency conflict. Gateway reservations use a random operation-scoped reservation ID so caller-controlled legacy `request_id` values cannot collide with the gateway's reservation records.
 
