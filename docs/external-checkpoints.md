@@ -147,3 +147,35 @@ The document is returned directly as `application/json`; save that exact respons
 The API does not store GitHub credentials or publish checkpoints automatically. Publication to an independently controlled repository or storage account is a separate integration step and must be explicit.
 
 Retain every checkpoint in sequence to preserve the verifiable history.
+
+
+## Format v2 — locally anchored snapshot completeness
+
+New exports use format version 2. In addition to the v1 fields, the document
+contains `snapshot_event_id`: the greatest Gateway audit `event_id` visible
+inside the export's consistent SQLite snapshot. Export runs under
+`BEGIN IMMEDIATE` and atomically stores a local registry record containing the
+checkpoint ID, installation ID, sequence, snapshot watermark, operation count,
+checkpoint hash, predecessor hash, and creation time.
+
+During v2 verification, AgentGuard requires the supplied checkpoint to match
+that local registry record. It then derives the expected operation set from
+local operations having at least one audit event with `event_id` less than or
+equal to the recorded watermark. The derived set and count must exactly match
+the checkpoint document. This detects a document that omits an operation and
+recomputes its unkeyed SHA-256 hash. Operations created after the watermark are
+excluded, so later valid activity does not invalidate an older checkpoint.
+Appended events on an operation are still allowed; the checkpointed event
+prefix must remain present and unchanged.
+
+Format v1 documents remain readable for backward compatibility. They are
+reported with `completeness_verified: false`, because they contain no
+snapshot watermark or matching local registry anchor.
+
+**Trust boundary:** the local checkpoint registry is a trusted reference for
+the specific completeness check in Issue #68. It is stored in the same SQLite
+database and does not protect against an attacker who can rewrite both the
+database and registry. Independently retained checkpoint documents remain
+necessary to detect coordinated rewrites of the full local database. The
+checkpoint hash remains an unkeyed integrity digest, not a signature or proof
+of publisher identity.
