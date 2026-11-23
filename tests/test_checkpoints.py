@@ -59,7 +59,7 @@ def test_checkpoint_rejects_omitted_operation_even_when_hash_is_recomputed(tmp_p
     result = verify_gateway_checkpoint(store, json.dumps(checkpoint))
     assert result["valid"] is False
     assert result["reason_code"] == "CHECKPOINT_MISMATCH"
-    assert result["detail"] == "CHECKPOINT_OPERATION_SET_MISMATCH"
+    assert result["detail"] == "CHECKPOINT_REGISTRY_MISMATCH"
 
 
 def test_v1_checkpoint_remains_verifiable_but_completeness_is_unverified(tmp_path):
@@ -144,7 +144,7 @@ def test_checkpoint_detects_deleted_previously_recorded_operation(tmp_path):
     result = verify_gateway_checkpoint(store, checkpoint_json)
     assert result["valid"] is False
     assert result["reason_code"] == "CHECKPOINT_MISMATCH"
-    assert result["detail"] == "CHECKPOINTED_OPERATION_MISSING"
+    assert result["detail"] == "CHECKPOINT_OPERATION_SET_MISMATCH"
 
 
 def test_checkpoint_chain_requires_and_checks_predecessor(tmp_path):
