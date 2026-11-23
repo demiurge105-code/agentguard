@@ -262,6 +262,25 @@ def test_worker_typed_verified_failure_releases_reservation(tmp_path):
     assert final["reservation_status"] == "RELEASED"
 
 
+
+def test_worker_none_executor_outcome_becomes_unknown_and_is_not_retried(tmp_path):
+    store, _, _, _, operation = setup_operation(tmp_path)
+    calls = []
+
+    def executor(intent, operation_id):
+        calls.append(operation_id)
+        return None
+
+    worker = ExecutionWorker(store, executor, "worker-a")
+    assert worker.run_once() == operation["operation_id"]
+    assert worker.run_once() is None
+    assert calls == [operation["operation_id"]]
+
+    final = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert final["status"] == "UNKNOWN"
+    assert final["reservation_status"] == "RESERVED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "UNKNOWN"
+
 def test_unsupported_worker_output_is_unknown_and_not_persisted(tmp_path):
     store, _, _, _, operation = setup_operation(tmp_path)
     worker = ExecutionWorker(
