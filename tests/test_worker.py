@@ -27,7 +27,7 @@ def test_worker_executes_queued_job_and_settles_reservation(tmp_path):
     calls = []
     worker = ExecutionWorker(
         store,
-        lambda action, operation_id: calls.append((action, operation_id)),
+        lambda action, operation_id: calls.append((action, operation_id)) or ExecutionOutcome(OperationStatus.SUCCEEDED),
         "worker-a",
     )
 
@@ -215,7 +215,7 @@ def test_worker_result_persistence_failure_requires_unknown_recovery(tmp_path, m
     calls = []
     worker = ExecutionWorker(
         store,
-        lambda intent, operation_id: calls.append(operation_id),
+        lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED),
         "worker-a",
     )
     original_complete = store.complete_execution_job
@@ -309,7 +309,7 @@ def test_worker_rejects_malformed_intent_without_dispatch_and_continues_queue(tm
     calls = []
     worker = ExecutionWorker(
         store,
-        lambda intent, operation_id: calls.append(operation_id),
+        lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED),
         "worker-a",
     )
 
