@@ -7,6 +7,7 @@ import time
 import pytest
 
 from agentguard.gateway import (
+    ExecutionOutcome,
     GatewayAuthenticationError,
     OperationStatus,
     TrustedExecutionGateway,
@@ -37,7 +38,7 @@ def test_gateway_executes_approved_intent_and_persists_success(tmp_path):
 
     def executor(intent, operation_id):
         calls.append((intent, operation_id))
-        return None
+        return ExecutionOutcome(OperationStatus.SUCCEEDED)
 
     gateway = TrustedExecutionGateway(store, executor)
     intent = make_intent(policy_id)
@@ -79,7 +80,7 @@ def test_same_key_with_different_intent_conflicts(tmp_path, different_intent):
     store, policy_id, token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     first_intent = make_intent(policy_id)
     gateway.submit(first_intent, token, "conflicting-key")
@@ -106,7 +107,7 @@ def test_same_idempotency_key_under_different_policy_conflicts(tmp_path):
     store, policy_id, token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     gateway.submit(make_intent(policy_id), token, "global-key")
 
@@ -163,7 +164,7 @@ def test_token_revoked_between_reservation_and_claim_blocks_execution(tmp_path):
 
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda action, operation_id: calls.append(operation_id) or None
+        store, lambda action, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     result = gateway.submit(intent, new_token, "revoke-before-claim")
 
@@ -179,7 +180,7 @@ def test_revoked_token_cannot_replay_existing_operation(tmp_path):
     store, policy_id, old_token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     intent = make_intent(policy_id)
     gateway.submit(intent, old_token, "rotate-before-retry")
@@ -205,7 +206,7 @@ def test_failed_execution_claim_never_invokes_executor(tmp_path, monkeypatch):
 
     monkeypatch.setattr(store, "claim_gateway_operation", fail_claim)
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
 
     with pytest.raises(OSError, match="database unavailable"):
@@ -218,7 +219,7 @@ def test_failed_completion_persistence_does_not_retry_executor(tmp_path, monkeyp
     store, policy_id, token = make_store(tmp_path)
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     original_complete = store.complete_gateway_operation
 
@@ -287,7 +288,7 @@ def test_successful_operation_reserves_budget_only_once(tmp_path):
     store, policy_id, token = make_store(tmp_path, daily_limit="20")
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     intent = make_intent(policy_id, amount="10")
 
@@ -329,7 +330,7 @@ def test_concurrent_exact_retries_invoke_executor_at_most_once(tmp_path):
         with lock:
             calls.append(operation_id)
         time.sleep(0.05)
-        return None
+        return ExecutionOutcome(OperationStatus.SUCCEEDED)
 
     gateway = TrustedExecutionGateway(store, executor)
     intent = make_intent(policy_id)
@@ -354,7 +355,7 @@ def test_executor_receives_the_same_immutable_intent_that_was_canonicalized(tmp_
         store,
         lambda intent, operation_id: observed.append(
             (intent, intent.canonical_json, operation_id)
-        ) and None,
+        ) or ExecutionOutcome(OperationStatus.SUCCEEDED),
     )
     intent = make_intent(policy_id, amount="10.00")
 
@@ -388,7 +389,7 @@ def test_operation_key_is_separate_from_legacy_reservation_ids(tmp_path):
 
     calls = []
     gateway = TrustedExecutionGateway(
-        store, lambda intent, operation_id: calls.append(operation_id) or None
+        store, lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED)
     )
     result = gateway.submit(make_intent(policy_id), token, "shared-key")
 
@@ -414,7 +415,7 @@ def test_unknown_executor_outcome_keeps_budget_reserved(tmp_path):
     unknown = gateway.submit(make_intent(policy_id, "10"), token, "unknown-outcome")
     assert unknown.status is OperationStatus.UNKNOWN
     assert store.get_gateway_operation_by_id(unknown.operation_id)["reservation_status"] == "RESERVED"
-    denied = TrustedExecutionGateway(store, lambda intent, operation_id: None).submit(make_intent(policy_id, "11"), token, "after-unknown")
+    denied = TrustedExecutionGateway(store, lambda intent, operation_id: ExecutionOutcome(OperationStatus.SUCCEEDED)).submit(make_intent(policy_id, "11"), token, "after-unknown")
     assert denied.status is OperationStatus.DENIED
 
 
