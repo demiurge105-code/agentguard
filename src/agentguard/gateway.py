@@ -170,11 +170,9 @@ class TrustedExecutionGateway:
                 no_side_effect_confirmed = False
                 stored_result = "Executor returned unsupported data; outcome may be unknown."
             else:
-                terminal_status = OperationStatus.SUCCEEDED
+                terminal_status = OperationStatus.UNKNOWN
                 no_side_effect_confirmed = False
-                # Persist only a fixed status message, never arbitrary executor
-                # output that could accidentally contain credentials or secrets.
-                stored_result = "Execution completed."
+                stored_result = "Executor returned no explicit outcome; outcome may be unknown."
 
             if terminal_status is OperationStatus.FAILED:
                 stored = self._store.complete_gateway_operation(
@@ -202,9 +200,9 @@ class TrustedExecutionGateway:
 class PrintOnlyExecutor:
     """Minimal executor that prints a simulation and performs no external action."""
 
-    def __call__(self, intent: ActionIntent, operation_id: str) -> None:
+    def __call__(self, intent: ActionIntent, operation_id: str) -> ExecutionOutcome:
         print(
             f"Simulated operation {operation_id}: "
             f"{intent.amount} units to {intent.recipient}."
         )
-        return None
+        return ExecutionOutcome(OperationStatus.SUCCEEDED)
