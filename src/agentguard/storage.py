@@ -236,6 +236,21 @@ class SQLitePolicyStore:
                     """CREATE INDEX IF NOT EXISTS idx_gateway_operation_events_operation
                     ON gateway_operation_events(operation_id, event_id)"""
                 )
+
+                # Trusted local snapshot anchors let the verifier detect omitted
+                # operations in an exported document while allowing later writes.
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS gateway_checkpoints (
+                        checkpoint_id TEXT PRIMARY KEY,
+                        installation_id TEXT NOT NULL,
+                        sequence INTEGER NOT NULL CHECK (sequence >= 1),
+                        snapshot_event_id INTEGER NOT NULL CHECK (snapshot_event_id >= 0),
+                        operation_count INTEGER NOT NULL CHECK (operation_count >= 0),
+                        checkpoint_hash TEXT NOT NULL,
+                        previous_checkpoint_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )"""
+                )
                 connection.execute(
                     """CREATE TABLE IF NOT EXISTS gateway_execution_jobs (
                         operation_id TEXT PRIMARY KEY,
