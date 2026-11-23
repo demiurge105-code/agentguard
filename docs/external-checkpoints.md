@@ -172,6 +172,20 @@ Format v1 documents remain readable for backward compatibility. They are
 reported with `completeness_verified: false`, because they contain no
 snapshot watermark or matching local registry anchor.
 
+V2 uses the hash domain
+`agentguard.gateway-checkpoint.v2:` followed by the same canonical JSON
+encoding rules. Its additional document field is:
+
+```json
+{
+  "format_version": 2,
+  "snapshot_event_id": 42
+}
+```
+
+The value shown is illustrative. The watermark is a non-negative integer and
+is included in the v2 checkpoint hash.
+
 **Trust boundary:** the local checkpoint registry is a trusted reference for
 the specific completeness check in Issue #68. It is stored in the same SQLite
 database and does not protect against an attacker who can rewrite both the
