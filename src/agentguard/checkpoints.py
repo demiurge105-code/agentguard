@@ -13,15 +13,17 @@ from typing import Any
 from agentguard.storage import SQLitePolicyStore
 
 GENESIS_HASH = "0" * 64
-_CHECKPOINT_DOMAIN = b"agentguard.gateway-checkpoint.v1:"
+_CHECKPOINT_DOMAIN_V1 = b"agentguard.gateway-checkpoint.v1:"
+_CHECKPOINT_DOMAIN_V2 = b"agentguard.gateway-checkpoint.v2:"
 _OPERATION_REF_DOMAIN = b"agentguard.gateway-checkpoint-operation-ref.v1:"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _OPERATION_REF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_DOCUMENT_FIELDS = {
+_DOCUMENT_FIELDS_V1 = {
     "format_version", "installation_id", "checkpoint_id", "sequence",
     "created_at", "hash_algorithm", "event_chain_version", "operation_count",
     "operations", "previous_checkpoint_hash", "checkpoint_hash",
 }
+_DOCUMENT_FIELDS_V2 = _DOCUMENT_FIELDS_V1 | {"snapshot_event_id"}
 _OPERATION_FIELDS = {"operation_ref", "event_count", "head_hash"}
 
 
@@ -70,7 +72,9 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
 
 def _checkpoint_hash(document: dict[str, Any]) -> str:
     payload = {key: value for key, value in document.items() if key != "checkpoint_hash"}
-    return hashlib.sha256(_CHECKPOINT_DOMAIN + _canonical_json(payload)).hexdigest()
+    version = document.get("format_version")
+    domain = _CHECKPOINT_DOMAIN_V2 if version == 2 else _CHECKPOINT_DOMAIN_V1
+    return hashlib.sha256(domain + _canonical_json(payload)).hexdigest()
 
 
 def _operation_ref(operation_id: str) -> str:
@@ -114,10 +118,14 @@ def _parse_document(raw: str) -> dict[str, Any]:
 
 
 def _validate_document(document: dict[str, Any]) -> None:
-    if set(document) != _DOCUMENT_FIELDS:
-        raise CheckpointError("Checkpoint has missing or unknown fields.")
-    if _require_int(document["format_version"], "format_version", 1) != 1:
+    version = _require_int(document.get("format_version"), "format_version", 1)
+    expected_fields = _DOCUMENT_FIELDS_V1 if version == 1 else _DOCUMENT_FIELDS_V2 if version == 2 else None
+    if expected_fields is None:
         raise CheckpointError("Unsupported checkpoint format_version.")
+    if set(document) != expected_fields:
+        raise CheckpointError("Checkpoint has missing or unknown fields.")
+    if version == 2:
+        _require_int(document["snapshot_event_id"], "snapshot_event_id", 0)
     if document["hash_algorithm"] != "sha256":
         raise CheckpointError("Unsupported checkpoint hash_algorithm.")
     if _require_int(document["event_chain_version"], "event_chain_version", 1) != 1:
@@ -257,7 +265,9 @@ def create_gateway_checkpoint(
     """Create canonical checkpoint JSON from one consistent SQLite read snapshot."""
     connection = store._connect()
     try:
-        connection.execute("BEGIN")
+        # Serialize snapshot capture and registry insertion against all Gateway
+        # writers. The registry is the trusted local anchor for completeness.
+        connection.execute("BEGIN IMMEDIATE")
         installation_id = _read_installation_id(connection)
         predecessor = _validated_predecessor(previous_checkpoint_json, installation_id)
         if predecessor is None:
@@ -266,9 +276,19 @@ def create_gateway_checkpoint(
             sequence = predecessor["sequence"] + 1
             previous_hash = predecessor["checkpoint_hash"]
 
+        snapshot_event_id = connection.execute(
+            "SELECT COALESCE(MAX(event_id), 0) FROM gateway_operation_events"
+        ).fetchone()[0]
         operation_rows = connection.execute(
             """SELECT operation_id, audit_event_count, audit_head_hash
-            FROM gateway_operations ORDER BY operation_id"""
+            FROM gateway_operations AS operations
+            WHERE EXISTS (
+                SELECT 1 FROM gateway_operation_events AS events
+                WHERE events.operation_id = operations.operation_id
+                  AND events.event_id <= ?
+            )
+            ORDER BY operation_id""",
+            (snapshot_event_id,),
         ).fetchall()
         entries = []
         for operation in operation_rows:
@@ -286,8 +306,9 @@ def create_gateway_checkpoint(
         entries.sort(key=lambda item: item["operation_ref"])
 
         document: dict[str, Any] = {
-            "format_version": 1,
+            "format_version": 2,
             "installation_id": installation_id,
+            "snapshot_event_id": snapshot_event_id,
             "checkpoint_id": str(uuid.uuid4()),
             "sequence": sequence,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -299,6 +320,18 @@ def create_gateway_checkpoint(
         }
         document["checkpoint_hash"] = _checkpoint_hash(document)
         _validate_document(document)
+        connection.execute(
+            """INSERT INTO gateway_checkpoints (
+                checkpoint_id, installation_id, sequence, snapshot_event_id,
+                operation_count, checkpoint_hash, previous_checkpoint_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                document["checkpoint_id"], installation_id, sequence,
+                snapshot_event_id, len(entries), document["checkpoint_hash"],
+                previous_hash, document["created_at"],
+            ),
+        )
+        connection.commit()
         return json.dumps(
             document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -333,9 +366,44 @@ def verify_gateway_checkpoint(
         if installation_id != document["installation_id"]:
             return {"valid": False, "reason_code": "INSTALLATION_ID_MISMATCH"}
 
-        local_operations = connection.execute(
-            "SELECT operation_id, audit_event_count, audit_head_hash FROM gateway_operations"
-        ).fetchall()
+        checkpoint_record = None
+        if document["format_version"] == 2:
+            checkpoint_record = connection.execute(
+                """SELECT installation_id, sequence, snapshot_event_id,
+                          operation_count, checkpoint_hash,
+                          previous_checkpoint_hash, created_at
+                FROM gateway_checkpoints WHERE checkpoint_id = ?""",
+                (document["checkpoint_id"],),
+            ).fetchone()
+            if checkpoint_record is None or any((
+                checkpoint_record["installation_id"] != document["installation_id"],
+                checkpoint_record["sequence"] != document["sequence"],
+                checkpoint_record["snapshot_event_id"] != document["snapshot_event_id"],
+                checkpoint_record["operation_count"] != document["operation_count"],
+                checkpoint_record["checkpoint_hash"] != document["checkpoint_hash"],
+                checkpoint_record["previous_checkpoint_hash"] != document["previous_checkpoint_hash"],
+                checkpoint_record["created_at"] != document["created_at"],
+            )):
+                return {
+                    "valid": False, "reason_code": "CHECKPOINT_MISMATCH",
+                    "detail": "CHECKPOINT_REGISTRY_MISMATCH",
+                }
+            local_operations = connection.execute(
+                """SELECT operation_id, audit_event_count, audit_head_hash
+                FROM gateway_operations AS operations
+                WHERE EXISTS (
+                    SELECT 1 FROM gateway_operation_events AS events
+                    WHERE events.operation_id = operations.operation_id
+                      AND events.event_id <= ?
+                )""",
+                (document["snapshot_event_id"],),
+            ).fetchall()
+        else:
+            # v1 remains readable for compatibility, but its snapshot boundary
+            # was never anchored locally, so completeness cannot be established.
+            local_operations = connection.execute(
+                "SELECT operation_id, audit_event_count, audit_head_hash FROM gateway_operations"
+            ).fetchall()
         by_ref: dict[str, sqlite3.Row] = {}
         for operation in local_operations:
             ref = _operation_ref(operation["operation_id"])
@@ -350,6 +418,17 @@ def verify_gateway_checkpoint(
             {item["operation_ref"]: item for item in predecessor["operations"]}
             if predecessor is not None else {}
         )
+        if document["format_version"] == 2:
+            local_refs = set(by_ref)
+            checkpoint_refs = set(document_by_ref)
+            if (
+                len(local_operations) != document["operation_count"]
+                or local_refs != checkpoint_refs
+            ):
+                return {
+                    "valid": False, "reason_code": "CHECKPOINT_MISMATCH",
+                    "detail": "CHECKPOINT_OPERATION_SET_MISMATCH",
+                }
         for previous_ref, previous_item in predecessor_by_ref.items():
             current_item = document_by_ref.get(previous_ref)
             if current_item is None:
@@ -411,6 +490,7 @@ def verify_gateway_checkpoint(
             "sequence": document["sequence"],
             "operation_count": document["operation_count"],
             "checkpoint_hash": document["checkpoint_hash"],
+            "completeness_verified": document["format_version"] == 2,
         }
     finally:
         if connection.in_transaction:
