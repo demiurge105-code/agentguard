@@ -286,6 +286,7 @@ def test_worker_none_executor_outcome_becomes_unknown_and_is_not_retried(tmp_pat
     assert final["reservation_status"] == "RESERVED"
     assert store.get_gateway_execution_status(operation["operation_id"]) == "UNKNOWN"
 
+
 def test_unsupported_worker_output_is_unknown_and_not_persisted(tmp_path):
     store, _, _, _, operation = setup_operation(tmp_path)
     worker = ExecutionWorker(
@@ -333,7 +334,10 @@ def test_worker_rejects_malformed_intent_without_dispatch_and_continues_queue(tm
     calls = []
     worker = ExecutionWorker(
         store,
-        lambda intent, operation_id: calls.append(operation_id) or ExecutionOutcome(OperationStatus.SUCCEEDED),
+        lambda intent, operation_id: (
+            calls.append(operation_id)
+            or ExecutionOutcome(OperationStatus.SUCCEEDED)
+        ),
         "worker-a",
     )
 
