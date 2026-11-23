@@ -326,6 +326,7 @@ def test_none_executor_outcome_becomes_unknown_and_is_not_retried(tmp_path):
     assert denied.status is OperationStatus.DENIED
     assert len(calls) == 1
 
+
 def test_unsupported_executor_output_is_not_persisted(tmp_path):
     store, policy_id, token = make_store(tmp_path)
     gateway = TrustedExecutionGateway(
@@ -461,7 +462,6 @@ def test_operation_key_is_separate_from_legacy_reservation_ids(tmp_path):
 
 
 def test_typed_verified_failure_releases_daily_budget(tmp_path):
-    from agentguard.gateway import ExecutionOutcome
     store, policy_id, token = make_store(tmp_path, daily_limit="20")
     gateway = TrustedExecutionGateway(
         store,
