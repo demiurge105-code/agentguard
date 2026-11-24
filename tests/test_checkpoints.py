@@ -78,6 +78,9 @@ def test_v1_checkpoint_remains_verifiable_but_completeness_is_unverified(tmp_pat
     assert result["valid"] is True
     assert result["completeness_verified"] is False
 
+    with pytest.raises(CheckpointError, match="Legacy v1 predecessors"):
+        create_gateway_checkpoint(store, json.dumps(checkpoint))
+
 
 def test_checkpoint_allows_appended_events_and_new_operations(tmp_path):
     store, policy_id, token = make_store(tmp_path / "checkpoint-append.db")
@@ -160,6 +163,51 @@ def test_checkpoint_chain_requires_and_checks_predecessor(tmp_path):
     altered = json.loads(first_json)
     altered["sequence"] = 7
     assert verify_gateway_checkpoint(store, second_json, json.dumps(altered))["valid"] is False
+
+
+def test_checkpoint_rejects_unregistered_v2_predecessor_for_create_and_verify(tmp_path):
+    store, policy_id, token = make_store(tmp_path / "checkpoint-unregistered-predecessor.db")
+    create_operation(store, policy_id, token, "checkpoint-unregistered-predecessor")
+    first_json = create_gateway_checkpoint(store)
+    second_json = create_gateway_checkpoint(store, first_json)
+
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute(
+            "DELETE FROM gateway_checkpoints WHERE checkpoint_id = ?",
+            (json.loads(first_json)["checkpoint_id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(CheckpointError, match="not anchored"):
+        create_gateway_checkpoint(store, first_json)
+
+    result = verify_gateway_checkpoint(store, second_json, first_json)
+    assert result["valid"] is False
+    assert result["reason_code"] == "CHECKPOINT_MISMATCH"
+    assert result["detail"] == "PREDECESSOR_REGISTRY_MISMATCH"
+
+
+def test_checkpoint_rejects_predecessor_document_that_differs_from_registry(tmp_path):
+    store, policy_id, token = make_store(tmp_path / "checkpoint-predecessor-mismatch.db")
+    create_operation(store, policy_id, token, "checkpoint-predecessor-mismatch")
+    predecessor = json.loads(create_gateway_checkpoint(store))
+    predecessor["created_at"] = "2099-01-01T00:00:00+00:00"
+    payload = {
+        key: value for key, value in predecessor.items()
+        if key != "checkpoint_hash"
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    predecessor["checkpoint_hash"] = hashlib.sha256(
+        b"agentguard.gateway-checkpoint.v2:" + canonical
+    ).hexdigest()
+
+    with pytest.raises(CheckpointError, match="not anchored"):
+        create_gateway_checkpoint(store, json.dumps(predecessor))
 
 
 def test_checkpoint_rejects_duplicate_json_keys_and_boolean_integer(tmp_path):
