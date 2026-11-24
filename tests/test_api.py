@@ -1193,3 +1193,51 @@ async def test_gateway_checkpoint_export_fails_closed_on_local_audit_corruption(
 
     assert response.status_code == 503
     assert "refusing to export" in response.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_request_body_limit_rejects_oversized_unauthenticated_content_length(
+    tmp_path, monkeypatch
+):
+    payload = json.dumps({
+        "max_transaction": "1",
+        "daily_limit": "1",
+        "allowed_recipients": [],
+    })
+    monkeypatch.setenv("AGENTGUARD_MAX_REQUEST_BODY_BYTES", str(len(payload)))
+    app = create_app(SQLitePolicyStore(tmp_path / "body-limit.db"), "owner-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        exact = await client.post("/policies", content=payload)
+        oversized = await client.post("/policies", content=payload + " ")
+
+    assert exact.status_code == 401
+    assert oversized.status_code == 413
+    assert oversized.json() == {"detail": "Request body too large."}
+
+
+@pytest.mark.anyio
+async def test_request_body_limit_rejects_oversized_stream_without_content_length(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AGENTGUARD_MAX_REQUEST_BODY_BYTES", "64")
+    app = create_app(SQLitePolicyStore(tmp_path / "stream-limit.db"), "owner-token")
+
+    async def body_chunks():
+        yield b'{"data":"' + (b"x" * 40)
+        yield (b"x" * 40) + b'"}'
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/policies", content=body_chunks())
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Request body too large."}
+
+
+@pytest.mark.anyio
+async def test_request_body_limit_configuration_must_be_positive(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AGENTGUARD_MAX_REQUEST_BODY_BYTES", "0")
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        create_app(SQLitePolicyStore(tmp_path / "invalid-limit.db"), "owner-token")
