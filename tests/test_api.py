@@ -1210,10 +1210,17 @@ async def test_request_body_limit_rejects_oversized_unauthenticated_content_leng
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         exact = await client.post("/policies", content=payload)
         oversized = await client.post("/policies", content=payload + " ")
+        oversized_checkpoint = await client.post(
+            "/gateway/checkpoints/verify",
+            content='{"checkpoint_json":"' + ("x" * 100) + '"}',
+        )
 
     assert exact.status_code == 401
     assert oversized.status_code == 413
-    assert oversized.json() == {"detail": "Request body too large."}
+    assert oversized_checkpoint.status_code == 413
+    assert oversized.json() == oversized_checkpoint.json() == {
+        "detail": "Request body too large."
+    }
 
 
 @pytest.mark.anyio
@@ -1228,7 +1235,9 @@ async def test_request_body_limit_rejects_oversized_stream_without_content_lengt
         yield (b"x" * 40) + b'"}'
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post("/policies", content=body_chunks())
+        response = await client.post(
+            "/gateway/checkpoints/verify", content=body_chunks()
+        )
 
     assert response.status_code == 413
     assert response.json() == {"detail": "Request body too large."}
