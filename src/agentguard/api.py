@@ -37,7 +37,11 @@ class RequestBodyLimitMiddleware:
     """Buffer and cap every HTTP request body before calling the application."""
 
     def __init__(self, app: ASGIApp, max_body_size: int) -> None:
-        if isinstance(max_body_size, bool) or not isinstance(max_body_size, int) or max_body_size <= 0:
+        if (
+            isinstance(max_body_size, bool)
+            or not isinstance(max_body_size, int)
+            or max_body_size <= 0
+        ):
             raise ValueError("max_body_size must be a positive integer.")
         self.app = app
         self.max_body_size = max_body_size
@@ -64,32 +68,40 @@ class RequestBodyLimitMiddleware:
                 await self._send_error(send, 413, "Request body too large.")
                 return
 
-        buffered_messages: list[Message] = []
-        received = 0
+        body = bytearray()
+        disconnected = False
         while True:
             message = await receive()
-            message_type = message["type"]
-            if message_type == "http.request":
-                received += len(message.get("body", b""))
-                if received > self.max_body_size:
+            if message["type"] == "http.request":
+                chunk = message.get("body", b"")
+                if len(body) + len(chunk) > self.max_body_size:
                     await self._send_error(send, 413, "Request body too large.")
                     return
-                buffered_messages.append(message)
+                body.extend(chunk)
                 if not message.get("more_body", False):
                     break
-            elif message_type == "http.disconnect":
-                buffered_messages.append(message)
+            elif message["type"] == "http.disconnect":
+                disconnected = True
                 break
             else:
-                buffered_messages.append(message)
-                break
+                raise RuntimeError("Unexpected ASGI receive message.")
+
+        replay_messages: list[Message] = []
+        if not disconnected or body:
+            replay_messages.append({
+                "type": "http.request",
+                "body": bytes(body),
+                "more_body": disconnected,
+            })
+        if disconnected:
+            replay_messages.append({"type": "http.disconnect"})
 
         replay_index = 0
 
         async def replay_receive() -> Message:
             nonlocal replay_index
-            if replay_index < len(buffered_messages):
-                message = buffered_messages[replay_index]
+            if replay_index < len(replay_messages):
+                message = replay_messages[replay_index]
                 replay_index += 1
                 return message
             return await receive()
