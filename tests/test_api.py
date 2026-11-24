@@ -1202,7 +1202,7 @@ async def test_request_body_limit_rejects_oversized_unauthenticated_content_leng
     payload = json.dumps({
         "max_transaction": "1",
         "daily_limit": "1",
-        "allowed_recipients": [],
+        "allowed_recipients": ["Alice"],
     })
     monkeypatch.setenv("AGENTGUARD_MAX_REQUEST_BODY_BYTES", str(len(payload)))
     app = create_app(SQLitePolicyStore(tmp_path / "body-limit.db"), "owner-token")
@@ -1231,7 +1231,7 @@ async def test_request_body_limit_rejects_oversized_stream_without_content_lengt
     app = create_app(SQLitePolicyStore(tmp_path / "stream-limit.db"), "owner-token")
 
     async def body_chunks():
-        yield b'{"data":"' + (b"x" * 40)
+        yield b'{"checkpoint_json":"' + (b"x" * 40)
         yield (b"x" * 40) + b'"}'
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
