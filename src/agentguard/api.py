@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
@@ -13,6 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agentguard.chains import normalize_chain_id, normalize_recipient
 from agentguard.checkpoints import (
@@ -25,6 +27,120 @@ from agentguard.gateway import GatewayAuthenticationError, PrintOnlyExecutor, Tr
 from agentguard.intent import ActionIntent
 from agentguard.policy import Policy
 from agentguard.storage import IdempotencyConflict, SQLitePolicyStore
+
+
+DEFAULT_MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024
+CHECKPOINT_FIELD_MAX_CHARS = 5_000_000
+
+
+class RequestBodyLimitMiddleware:
+    """Buffer and cap every HTTP request body before calling the application."""
+
+    def __init__(self, app: ASGIApp, max_body_size: int) -> None:
+        if (
+            isinstance(max_body_size, bool)
+            or not isinstance(max_body_size, int)
+            or max_body_size <= 0
+        ):
+            raise ValueError("max_body_size must be a positive integer.")
+        self.app = app
+        self.max_body_size = max_body_size
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        content_lengths = [
+            value for name, value in scope.get("headers", [])
+            if name.lower() == b"content-length"
+        ]
+        if content_lengths:
+            if len(content_lengths) != 1 or not content_lengths[0].isdigit():
+                await self._send_error(send, 400, "Invalid Content-Length header.")
+                return
+            try:
+                declared_length = int(content_lengths[0])
+            except ValueError:
+                await self._send_error(send, 400, "Invalid Content-Length header.")
+                return
+            if declared_length > self.max_body_size:
+                await self._send_error(send, 413, "Request body too large.")
+                return
+
+        body = bytearray()
+        disconnected = False
+        while True:
+            message = await receive()
+            if message["type"] == "http.request":
+                chunk = message.get("body", b"")
+                if len(body) + len(chunk) > self.max_body_size:
+                    await self._send_error(send, 413, "Request body too large.")
+                    return
+                body.extend(chunk)
+                if not message.get("more_body", False):
+                    break
+            elif message["type"] == "http.disconnect":
+                disconnected = True
+                break
+            else:
+                raise RuntimeError("Unexpected ASGI receive message.")
+
+        body_bytes = bytes(body)
+        del body
+
+        replay_messages: list[Message] = []
+        if not disconnected or body_bytes:
+            replay_messages.append({
+                "type": "http.request",
+                "body": body_bytes,
+                "more_body": disconnected,
+            })
+        if disconnected:
+            replay_messages.append({"type": "http.disconnect"})
+
+        replay_index = 0
+
+        async def replay_receive() -> Message:
+            nonlocal replay_index
+            if replay_index < len(replay_messages):
+                message = replay_messages[replay_index]
+                replay_index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    async def _send_error(send: Send, status_code: int, detail: str) -> None:
+        body = json.dumps({"detail": detail}, separators=(",", ":")).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+def _request_body_limit_from_env() -> int:
+    raw_value = os.getenv(
+        "AGENTGUARD_MAX_REQUEST_BODY_BYTES",
+        str(DEFAULT_MAX_REQUEST_BODY_BYTES),
+    )
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "AGENTGUARD_MAX_REQUEST_BODY_BYTES must be a positive integer."
+        ) from error
+    if value <= 0:
+        raise ValueError(
+            "AGENTGUARD_MAX_REQUEST_BODY_BYTES must be a positive integer."
+        )
+    return value
 
 
 class PolicyInput(BaseModel):
@@ -145,14 +261,14 @@ class GatewayReconciliationInput(BaseModel):
 class GatewayCheckpointExportInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    previous_checkpoint_json: str | None = Field(default=None, max_length=10_000_000)
+    previous_checkpoint_json: str | None = Field(default=None, max_length=CHECKPOINT_FIELD_MAX_CHARS)
 
 
 class GatewayCheckpointVerifyInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    checkpoint_json: str = Field(min_length=1, max_length=10_000_000)
-    previous_checkpoint_json: str | None = Field(default=None, max_length=10_000_000)
+    checkpoint_json: str = Field(min_length=1, max_length=CHECKPOINT_FIELD_MAX_CHARS)
+    previous_checkpoint_json: str | None = Field(default=None, max_length=CHECKPOINT_FIELD_MAX_CHARS)
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -194,6 +310,10 @@ def create_app(
         admin_token = os.getenv("AGENTGUARD_ADMIN_TOKEN")
 
     application = FastAPI(title="AgentGuard API")
+    application.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_size=_request_body_limit_from_env(),
+    )
 
     def require_admin(
         credentials: HTTPAuthorizationCredentials | None,

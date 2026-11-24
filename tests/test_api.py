@@ -1193,3 +1193,171 @@ async def test_gateway_checkpoint_export_fails_closed_on_local_audit_corruption(
 
     assert response.status_code == 503
     assert "refusing to export" in response.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_request_body_limit_rejects_oversized_unauthenticated_content_length(
+    tmp_path, monkeypatch
+):
+    payload = json.dumps({
+        "max_transaction": "1",
+        "daily_limit": "1",
+        "allowed_recipients": ["Alice"],
+    })
+    monkeypatch.setenv("AGENTGUARD_MAX_REQUEST_BODY_BYTES", str(len(payload)))
+    app = create_app(SQLitePolicyStore(tmp_path / "body-limit.db"), "owner-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        exact = await client.post(
+            "/policies",
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        oversized = await client.post("/policies", content=payload + " ")
+        oversized_checkpoint = await client.post(
+            "/gateway/checkpoints/verify",
+            content='{"checkpoint_json":"' + ("x" * 100) + '"}',
+        )
+
+    assert exact.status_code == 401
+    assert oversized.status_code == 413
+    assert oversized_checkpoint.status_code == 413
+    assert oversized.json() == oversized_checkpoint.json() == {
+        "detail": "Request body too large."
+    }
+
+
+@pytest.mark.anyio
+async def test_request_body_limit_rejects_oversized_stream_without_content_length(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AGENTGUARD_MAX_REQUEST_BODY_BYTES", "64")
+    app = create_app(SQLitePolicyStore(tmp_path / "stream-limit.db"), "owner-token")
+
+    async def body_chunks():
+        yield b'{"checkpoint_json":"' + (b"x" * 40)
+        yield (b"x" * 40) + b'"}'
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/gateway/checkpoints/verify", content=body_chunks()
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Request body too large."}
+
+
+@pytest.mark.anyio
+async def test_request_body_limit_configuration_must_be_positive(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AGENTGUARD_MAX_REQUEST_BODY_BYTES", "0")
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        create_app(SQLitePolicyStore(tmp_path / "invalid-limit.db"), "owner-token")
+
+
+@pytest.mark.anyio
+async def test_body_limit_checks_stream_before_calling_app_even_if_app_ignores_body():
+    middleware_app_called = False
+    sent = []
+    messages = [
+        {"type": "http.request", "body": b"1234", "more_body": True},
+        {"type": "http.request", "body": b"5", "more_body": False},
+    ]
+    message_index = 0
+
+    async def receive():
+        nonlocal message_index
+        message = messages[message_index]
+        message_index += 1
+        return message
+
+    async def app(scope, receive, send):
+        nonlocal middleware_app_called
+        middleware_app_called = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = api_module.RequestBodyLimitMiddleware(app, max_body_size=4)
+    await middleware(
+        {"type": "http", "method": "GET", "path": "/does-not-read-body",
+         "headers": [(b"content-length", b"4")]},
+        receive,
+        send,
+    )
+
+    starts = [message for message in sent if message["type"] == "http.response.start"]
+    assert middleware_app_called is False
+    assert len(starts) == 1
+    assert starts[0]["status"] == 413
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"content-length", b"4"), (b"content-length", b"4")],
+        [(b"content-length", b"four")],
+        [(b"content-length", b"-1")],
+    ],
+)
+async def test_body_limit_rejects_invalid_or_duplicate_content_length(headers):
+    app_called = False
+    sent = []
+
+    async def receive():
+        raise AssertionError("Request body must not be read for invalid headers")
+
+    async def app(scope, receive, send):
+        nonlocal app_called
+        app_called = True
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = api_module.RequestBodyLimitMiddleware(app, max_body_size=10)
+    await middleware(
+        {"type": "http", "method": "POST", "path": "/",
+         "headers": headers},
+        receive,
+        send,
+    )
+
+    starts = [message for message in sent if message["type"] == "http.response.start"]
+    assert app_called is False
+    assert len(starts) == 1
+    assert starts[0]["status"] == 400
+
+
+@pytest.mark.anyio
+async def test_body_limit_allows_exact_boundary_and_sends_only_one_response():
+    sent = []
+    messages = [{"type": "http.request", "body": b"1234", "more_body": False}]
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}
+
+    async def app(scope, receive, send):
+        # Deliberately do not consume the request body.
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = api_module.RequestBodyLimitMiddleware(app, max_body_size=4)
+    await middleware(
+        {"type": "http", "method": "GET", "path": "/",
+         "headers": [(b"content-length", b"4")]},
+        receive,
+        send,
+    )
+
+    starts = [message for message in sent if message["type"] == "http.response.start"]
+    assert len(starts) == 1
+    assert starts[0]["status"] == 204
