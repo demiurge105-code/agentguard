@@ -30,7 +30,7 @@ from agentguard.storage import IdempotencyConflict, SQLitePolicyStore
 
 
 DEFAULT_MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024
-CHECKPOINT_FIELD_MAX_BYTES = 5_000_000
+CHECKPOINT_FIELD_MAX_CHARS = 5_000_000
 
 
 class _RequestBodyTooLarge(Exception):
@@ -59,7 +59,11 @@ class RequestBodyLimitMiddleware:
             if len(content_lengths) != 1 or not content_lengths[0].isdigit():
                 await self._send_error(send, 400, "Invalid Content-Length header.")
                 return
-            declared_length = int(content_lengths[0])
+            try:
+                declared_length = int(content_lengths[0])
+            except ValueError:
+                await self._send_error(send, 400, "Invalid Content-Length header.")
+                return
             if declared_length > self.max_body_size:
                 await self._send_error(send, 413, "Request body too large.")
                 return
@@ -230,14 +234,14 @@ class GatewayReconciliationInput(BaseModel):
 class GatewayCheckpointExportInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    previous_checkpoint_json: str | None = Field(default=None, max_length=CHECKPOINT_FIELD_MAX_BYTES)
+    previous_checkpoint_json: str | None = Field(default=None, max_length=CHECKPOINT_FIELD_MAX_CHARS)
 
 
 class GatewayCheckpointVerifyInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    checkpoint_json: str = Field(min_length=1, max_length=CHECKPOINT_FIELD_MAX_BYTES)
-    previous_checkpoint_json: str | None = Field(default=None, max_length=CHECKPOINT_FIELD_MAX_BYTES)
+    checkpoint_json: str = Field(min_length=1, max_length=CHECKPOINT_FIELD_MAX_CHARS)
+    previous_checkpoint_json: str | None = Field(default=None, max_length=CHECKPOINT_FIELD_MAX_CHARS)
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
