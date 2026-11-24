@@ -192,6 +192,33 @@ def _validated_predecessor(
     return predecessor
 
 
+def _verify_registered_predecessor(
+    connection: sqlite3.Connection, predecessor: dict[str, Any]
+) -> bool:
+    """Verify local provenance for v2 predecessors; report v1 as unanchored."""
+    if predecessor["format_version"] == 1:
+        return False
+
+    record = connection.execute(
+        """SELECT checkpoint_id, installation_id, sequence, snapshot_event_id,
+                  operation_count, checkpoint_hash, previous_checkpoint_hash, created_at
+        FROM gateway_checkpoints WHERE checkpoint_id = ?""",
+        (predecessor["checkpoint_id"],),
+    ).fetchone()
+    if record is None or any((
+        record["checkpoint_id"] != predecessor["checkpoint_id"],
+        record["installation_id"] != predecessor["installation_id"],
+        record["sequence"] != predecessor["sequence"],
+        record["snapshot_event_id"] != predecessor["snapshot_event_id"],
+        record["operation_count"] != predecessor["operation_count"],
+        record["checkpoint_hash"] != predecessor["checkpoint_hash"],
+        record["previous_checkpoint_hash"] != predecessor["previous_checkpoint_hash"],
+        record["created_at"] != predecessor["created_at"],
+    )):
+        raise CheckpointError("Predecessor is not anchored in the local checkpoint registry.")
+    return True
+
+
 def _check_chain_link(
     document: dict[str, Any], predecessor: dict[str, Any] | None
 ) -> None:
@@ -273,6 +300,11 @@ def create_gateway_checkpoint(
         if predecessor is None:
             sequence, previous_hash = 1, GENESIS_HASH
         else:
+            if predecessor["format_version"] == 1:
+                raise CheckpointError(
+                    "Legacy v1 predecessors cannot anchor a new v2 checkpoint."
+                )
+            _verify_registered_predecessor(connection, predecessor)
             sequence = predecessor["sequence"] + 1
             previous_hash = predecessor["checkpoint_hash"]
 
@@ -365,6 +397,18 @@ def verify_gateway_checkpoint(
             return {"valid": False, "reason_code": "INSTALLATION_ID_MISSING"}
         if installation_id != document["installation_id"]:
             return {"valid": False, "reason_code": "INSTALLATION_ID_MISMATCH"}
+
+        predecessor_provenance_verified = predecessor is None
+        if predecessor is not None:
+            try:
+                predecessor_provenance_verified = _verify_registered_predecessor(
+                    connection, predecessor
+                )
+            except CheckpointError:
+                return {
+                    "valid": False, "reason_code": "CHECKPOINT_MISMATCH",
+                    "detail": "PREDECESSOR_REGISTRY_MISMATCH",
+                }
 
         checkpoint_record = None
         if document["format_version"] == 2:
@@ -491,6 +535,7 @@ def verify_gateway_checkpoint(
             "operation_count": document["operation_count"],
             "checkpoint_hash": document["checkpoint_hash"],
             "completeness_verified": document["format_version"] == 2,
+            "predecessor_provenance_verified": predecessor_provenance_verified,
         }
     finally:
         if connection.in_transaction:
