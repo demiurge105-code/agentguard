@@ -1208,7 +1208,11 @@ async def test_request_body_limit_rejects_oversized_unauthenticated_content_leng
     app = create_app(SQLitePolicyStore(tmp_path / "body-limit.db"), "owner-token")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        exact = await client.post("/policies", content=payload)
+        exact = await client.post(
+            "/policies",
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
         oversized = await client.post("/policies", content=payload + " ")
         oversized_checkpoint = await client.post(
             "/gateway/checkpoints/verify",
