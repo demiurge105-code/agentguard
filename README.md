@@ -121,7 +121,7 @@ export AGENTGUARD_ADMIN_TOKEN="replace-with-a-long-random-secret"
 $env:AGENTGUARD_ADMIN_TOKEN = "replace-with-a-long-random-secret"
 ```
 
-The SQLite database path can be changed with `AGENTGUARD_DB_PATH`. If unset, the application uses `agentguard.db` in the current working directory. The maximum HTTP request body defaults to 12 MiB and can be changed with `AGENTGUARD_MAX_REQUEST_BODY_BYTES` (a positive integer byte count). The limit is enforced before FastAPI parses the body and applies to authenticated and unauthenticated requests. Checkpoint input strings are each limited to 5,000,000 characters so a pair fits within the default request cap.
+The SQLite database path can be changed with `AGENTGUARD_DB_PATH`. If unset, the application uses `agentguard.db` in the current working directory. The maximum HTTP request body defaults to 12 MiB and can be changed with `AGENTGUARD_MAX_REQUEST_BODY_BYTES` (a positive integer byte count). The ASGI middleware reads and caps each HTTP request body before invoking FastAPI, including requests to routes that do not consume a body. Checkpoint input strings are each limited to 5,000,000 characters; the total request-byte limit still applies, and two maximum-length fields are not guaranteed to fit because UTF-8 encoding and JSON overhead affect the byte size.
 
 If `AGENTGUARD_ADMIN_TOKEN` is unset or empty, policy creation and token rotation fail closed with HTTP 401.
 
