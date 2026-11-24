@@ -33,7 +33,7 @@ DEFAULT_MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024
 CHECKPOINT_FIELD_MAX_CHARS = 5_000_000
 
 
-class _RequestBodyTooLarge(Exception):
+class _RequestBodyTooLarge(BaseException):
     """Raised when a streamed HTTP request exceeds the configured body limit."""
 
 
