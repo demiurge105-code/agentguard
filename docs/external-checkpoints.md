@@ -139,7 +139,7 @@ More specific internal mismatch reasons may be exposed where useful (for example
 
 The initial implementation exposes two owner-authenticated API endpoints:
 
-- `POST /gateway/checkpoints/export` returns a canonical JSON checkpoint document. Send an empty JSON object for the genesis checkpoint. To create a later checkpoint, send the immediately preceding document as a string in `previous_checkpoint_json`.
+- `POST /gateway/checkpoints/export` returns a canonical JSON checkpoint document. Send an empty JSON object for the genesis checkpoint. To create a later checkpoint, send the immediately preceding document as a string in `previous_checkpoint_json`. Each checkpoint input string is limited to 5,000,000 characters, and the HTTP API enforces a 12 MiB total request-body limit by default (configurable with `AGENTGUARD_MAX_REQUEST_BODY_BYTES`).
 - `POST /gateway/checkpoints/verify` accepts the document as a string in `checkpoint_json`. For a checkpoint with sequence greater than one, also provide its predecessor as a string in `previous_checkpoint_json`.
 
 The document is returned directly as `application/json`; save that exact response outside the AgentGuard database. Passing imported documents as strings allows the parser to reject duplicate JSON object keys before normal object decoding can discard them. When verifying a later checkpoint, verification also requires every operation and event prefix recorded by its immediate predecessor to remain present and unchanged.
