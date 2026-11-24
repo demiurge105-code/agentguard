@@ -33,12 +33,8 @@ DEFAULT_MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024
 CHECKPOINT_FIELD_MAX_CHARS = 5_000_000
 
 
-class _RequestBodyTooLarge(BaseException):
-    """Raised when a streamed HTTP request exceeds the configured body limit."""
-
-
 class RequestBodyLimitMiddleware:
-    """Enforce a hard request-body cap before FastAPI parses request data."""
+    """Buffer and cap every HTTP request body before calling the application."""
 
     def __init__(self, app: ASGIApp, max_body_size: int) -> None:
         if isinstance(max_body_size, bool) or not isinstance(max_body_size, int) or max_body_size <= 0:
@@ -68,21 +64,37 @@ class RequestBodyLimitMiddleware:
                 await self._send_error(send, 413, "Request body too large.")
                 return
 
+        buffered_messages: list[Message] = []
         received = 0
-
-        async def limited_receive() -> Message:
-            nonlocal received
+        while True:
             message = await receive()
-            if message["type"] == "http.request":
+            message_type = message["type"]
+            if message_type == "http.request":
                 received += len(message.get("body", b""))
                 if received > self.max_body_size:
-                    raise _RequestBodyTooLarge
-            return message
+                    await self._send_error(send, 413, "Request body too large.")
+                    return
+                buffered_messages.append(message)
+                if not message.get("more_body", False):
+                    break
+            elif message_type == "http.disconnect":
+                buffered_messages.append(message)
+                break
+            else:
+                buffered_messages.append(message)
+                break
 
-        try:
-            await self.app(scope, limited_receive, send)
-        except _RequestBodyTooLarge:
-            await self._send_error(send, 413, "Request body too large.")
+        replay_index = 0
+
+        async def replay_receive() -> Message:
+            nonlocal replay_index
+            if replay_index < len(buffered_messages):
+                message = buffered_messages[replay_index]
+                replay_index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
 
     @staticmethod
     async def _send_error(send: Send, status_code: int, detail: str) -> None:
