@@ -86,11 +86,14 @@ class RequestBodyLimitMiddleware:
             else:
                 raise RuntimeError("Unexpected ASGI receive message.")
 
+        body_bytes = bytes(body)
+        del body
+
         replay_messages: list[Message] = []
-        if not disconnected or body:
+        if not disconnected or body_bytes:
             replay_messages.append({
                 "type": "http.request",
-                "body": bytes(body),
+                "body": body_bytes,
                 "more_body": disconnected,
             })
         if disconnected:
