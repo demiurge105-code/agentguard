@@ -719,4 +719,7 @@ def test_pre_dispatch_reservation_release_audit_is_atomic(tmp_path, monkeypatch)
     assert current["reservation_status"] == "RESERVED"
     assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
     events = store.list_gateway_operation_events(operation["operation_id"])
-    assert [event["event_type"] for event in events] == ["OPERATION_CREATED"]
+    assert [event["event_type"] for event in events] == [
+        "OPERATION_CREATED",
+        "WORKER_LEASED",
+    ]
