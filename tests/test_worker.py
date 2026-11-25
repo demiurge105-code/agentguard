@@ -353,6 +353,8 @@ def test_worker_rejects_malformed_intent_without_dispatch_and_continues_queue(tm
     ]
     assert events[-1]["previous_status"] == "FAILED"
     assert events[-1]["new_status"] == "FAILED"
+    assert events[-1]["actor_type"] == "worker"
+    assert events[-1]["actor_id"] == "worker-a"
     assert calls == []
 
     assert worker.run_once() == valid["operation_id"]
