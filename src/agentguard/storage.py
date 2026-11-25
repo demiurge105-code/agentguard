@@ -1064,6 +1064,17 @@ class SQLitePolicyStore:
                 "Canonical action intent failed validation; executor was not started.",
                 timestamp,
             )
+            self._insert_gateway_event(
+                connection,
+                operation_id,
+                "FAILED",
+                "FAILED",
+                "RESERVATION_RELEASED",
+                "system",
+                "pre-dispatch-validation",
+                "Budget reservation was released because the intent failed validation before dispatch.",
+                timestamp,
+            )
             connection.commit()
             return True
         except Exception:
