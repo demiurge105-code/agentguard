@@ -1070,8 +1070,8 @@ class SQLitePolicyStore:
                 "FAILED",
                 "FAILED",
                 "RESERVATION_RELEASED",
-                "system",
-                "pre-dispatch-validation",
+                "worker",
+                worker_id,
                 "Budget reservation was released because the intent failed validation before dispatch.",
                 timestamp,
             )
