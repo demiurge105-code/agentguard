@@ -347,7 +347,12 @@ def test_worker_rejects_malformed_intent_without_dispatch_and_continues_queue(tm
     assert rejected["reservation_status"] == "RELEASED"
     assert store.get_gateway_execution_status(malformed["operation_id"]) == "COMPLETED"
     events = store.list_gateway_operation_events(malformed["operation_id"])
-    assert events[-1]["event_type"] == "PRE_DISPATCH_VALIDATION_FAILED"
+    assert [event["event_type"] for event in events[-2:]] == [
+        "PRE_DISPATCH_VALIDATION_FAILED",
+        "RESERVATION_RELEASED",
+    ]
+    assert events[-1]["previous_status"] == "FAILED"
+    assert events[-1]["new_status"] == "FAILED"
     assert calls == []
 
     assert worker.run_once() == valid["operation_id"]
@@ -680,3 +685,36 @@ def test_token_rotation_racing_dispatch_has_one_atomic_winner(tmp_path):
         assert final["status"] == "CANCELLED"
         assert final["reservation_status"] == "RELEASED"
         assert store.get_gateway_execution_status(operation["operation_id"]) == "CANCELLED"
+
+
+def test_pre_dispatch_reservation_release_audit_is_atomic(tmp_path, monkeypatch):
+    import pytest
+
+    store, _, _, _, operation = setup_operation(tmp_path)
+    lease = store.claim_execution_job("worker-a")
+    assert lease is not None
+
+    original_insert = store._insert_gateway_event
+
+    def fail_on_release(connection, operation_id, previous_status, new_status,
+                        event_type, actor_type, actor_id, reason, created_at):
+        if event_type == "RESERVATION_RELEASED":
+            raise RuntimeError("simulated audit insert failure")
+        return original_insert(
+            connection, operation_id, previous_status, new_status,
+            event_type, actor_type, actor_id, reason, created_at,
+        )
+
+    monkeypatch.setattr(store, "_insert_gateway_event", fail_on_release)
+
+    with pytest.raises(RuntimeError, match="simulated audit insert failure"):
+        store.fail_pre_dispatch_validation(
+            operation["operation_id"], "worker-a", lease["fencing_token"]
+        )
+
+    current = store.get_gateway_operation_by_id(operation["operation_id"])
+    assert current["status"] == "APPROVED"
+    assert current["reservation_status"] == "RESERVED"
+    assert store.get_gateway_execution_status(operation["operation_id"]) == "LEASED"
+    events = store.list_gateway_operation_events(operation["operation_id"])
+    assert [event["event_type"] for event in events] == ["OPERATION_CREATED"]
